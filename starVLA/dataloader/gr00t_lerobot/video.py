@@ -37,6 +37,45 @@ except (ImportError, RuntimeError):
     TORCHCODEC_AVAILABLE = False
 
 
+# Per-process LRU cache of CUDA decoders. NVDEC session setup costs ~1s, so
+# reuse decoders across samples (dataset video files are few and large).
+# Requires DataLoader workers with a "spawn" multiprocessing context: CUDA
+# cannot be (re)initialized in a forked worker.
+_CUDA_DECODER_CACHE: "dict[str, object]" = {}
+_CUDA_DECODER_CACHE_CAP = 4
+
+# Per-process cache of decord readers + their frame-timestamp tables.
+# Keyed by path; kwargs are effectively constant per run.
+_DECORD_READER_CACHE = {}
+_DECORD_READER_CACHE_CAP = 8
+
+
+def _get_decord_reader(video_path: str, **video_backend_kwargs):
+    entry = _DECORD_READER_CACHE.get(video_path)
+    if entry is None:
+        vr = decord.VideoReader(video_path, **video_backend_kwargs)
+        frame_ts = vr.get_frame_timestamp(range(len(vr)))
+        if len(_DECORD_READER_CACHE) >= _DECORD_READER_CACHE_CAP:
+            _DECORD_READER_CACHE.pop(next(iter(_DECORD_READER_CACHE)))
+        _DECORD_READER_CACHE[video_path] = entry = (vr, frame_ts)
+    return entry
+
+
+def _get_cuda_decoder(video_path: str):
+    import os
+
+    if not TORCHCODEC_AVAILABLE:
+        raise ImportError("torchcodec is not available.")
+    decoder = _CUDA_DECODER_CACHE.get(video_path)
+    if decoder is None:
+        device = f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}"
+        decoder = torchcodec.decoders.VideoDecoder(video_path, device=device)
+        if len(_CUDA_DECODER_CACHE) >= _CUDA_DECODER_CACHE_CAP:
+            _CUDA_DECODER_CACHE.pop(next(iter(_CUDA_DECODER_CACHE)))
+        _CUDA_DECODER_CACHE[video_path] = decoder
+    return decoder
+
+
 def get_frames_by_indices(
     video_path: str,
     indices: list[int] | np.ndarray,
@@ -141,10 +180,10 @@ def get_frames_by_timestamps(
         # For some GPUs, AV format data cannot be read
         if not DECORD_AVAILABLE:
             raise ImportError("decord is not available.")
-        vr = decord.VideoReader(video_path, **video_backend_kwargs)
-        num_frames = len(vr)
-        # Retrieve the timestamps for each frame in the video
-        frame_ts: np.ndarray = vr.get_frame_timestamp(range(num_frames))
+        # LeRobot v3 packs many episodes per mp4, so workers reopen the same
+        # few large files constantly; cache readers (like the CUDA path) to
+        # avoid re-parsing the container index on every sample.
+        vr, frame_ts = _get_decord_reader(video_path, **video_backend_kwargs)
         # Map each requested timestamp to the closest frame index
         # Only take the first element of the frame_ts array which corresponds to start_seconds
         indices = np.abs(frame_ts[:, :1] - timestamps).argmin(axis=0)
@@ -157,6 +196,10 @@ def get_frames_by_timestamps(
             video_path, device="cpu", dimension_order="NHWC", num_ffmpeg_threads=0
         )
         return decoder.get_frames_played_at(seconds=timestamps).data.numpy()
+    elif video_backend == "torchcodec_cuda":
+        decoder = _get_cuda_decoder(video_path)
+        frames = decoder.get_frames_played_at(seconds=list(timestamps)).data  # NCHW on GPU
+        return frames.permute(0, 2, 3, 1).cpu().numpy()
     elif video_backend == "opencv":
         # Open the video file
         cap = cv2.VideoCapture(video_path, **video_backend_kwargs)

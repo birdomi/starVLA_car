@@ -952,7 +952,6 @@ class LeRobotSingleDataset(Dataset):
                                 "chunk_index": int(episode[chunk_col]),
                                 "file_index": int(episode[file_col]),
                             }
-                    print(video_file_indices)
                     episode_meta = {
                         "data/chunk_index": episode["data/chunk_index"],
                         "data/file_index": episode["data/file_index"],
@@ -1464,6 +1463,7 @@ class LeRobotSingleDataset(Dataset):
                     episode_chunk=chunk_index, episode_index=trajectory_id
                 )
                 assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
+                self._traj_stack_cache = None  # v2 path: no prebuilt arrays
                 return pd.read_parquet(parquet_path)
         elif self._lerobot_version == "v3.0":
             return self.get_trajectory_data_lerobot_v3(trajectory_id)
@@ -1483,10 +1483,32 @@ class LeRobotSingleDataset(Dataset):
                 chunk_index=chunk_index, file_index=file_index
             )
             assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-            file_data = pd.read_parquet(parquet_path)
-            
-            # filter by trajectory_id
-            episode_data = file_data.loc[file_data["episode_index"] == trajectory_id].copy()
+            # Fast path: read with pyarrow and convert list columns (state/action)
+            # straight into contiguous (T, D) arrays instead of pandas object
+            # columns that get np.stack'ed on every get_state_or_action call
+            # (was ~50ms/sample of pure Python overhead in the workers).
+            import pyarrow as pa
+            import pyarrow.compute as pc
+            import pyarrow.parquet as pq
+
+            # single-threaded: pyarrow's default thread pool (one per CPU) in every
+            # dataloader worker oversubscribes the host (64 workers x 64 threads)
+            table = pq.read_table(parquet_path, use_threads=False)
+            ep_col = table.column("episode_index").to_numpy()
+            if not bool((ep_col == trajectory_id).all()):  # merged (multi-episode) file
+                table = table.filter(pc.equal(table["episode_index"], trajectory_id))
+            cols, stacked = {}, {}
+            for name in table.column_names:
+                col = table.column(name).combine_chunks()
+                if pa.types.is_list(col.type) or pa.types.is_large_list(col.type) or pa.types.is_fixed_size_list(col.type):
+                    flat = col.flatten().to_numpy(zero_copy_only=False)
+                    arr = flat.reshape(len(col), -1)
+                    stacked[name] = arr
+                    cols[name] = list(arr)  # keep DataFrame column semantics (row arrays)
+                else:
+                    cols[name] = col.to_numpy(zero_copy_only=False)
+            episode_data = pd.DataFrame(cols)
+            self._traj_stack_cache = stacked
             return episode_data
 
 
@@ -1591,8 +1613,8 @@ class LeRobotSingleDataset(Dataset):
                 video_file_index = episode_meta["data/file_index"]
             video_filename = self.video_path_pattern.format(
                 video_key=original_key,
-                chunk_index=episode_meta["data/chunk_index"],
-                file_index=episode_meta["data/file_index"],
+                chunk_index=video_chunk_index,
+                file_index=video_file_index,
             )
         return self.dataset_path / video_filename
 
@@ -1724,7 +1746,11 @@ class LeRobotSingleDataset(Dataset):
         # Get the data array, shape: (T, D)
         assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
         assert le_key in self.curr_traj_data.columns, f"No {le_key} found in {trajectory_id=}"
-        data_array: np.ndarray = np.stack(self.curr_traj_data[le_key])  # type: ignore
+        _cache = getattr(self, "_traj_stack_cache", None)
+        if _cache is not None and le_key in _cache:
+            data_array: np.ndarray = _cache[le_key]  # prebuilt (T, D) by get_trajectory_data_lerobot_v3
+        else:
+            data_array = np.stack(self.curr_traj_data[le_key])  # type: ignore
         assert data_array.ndim == 2, f"Expected 2D array, got key {le_key} is{data_array.shape} array"
         le_indices = np.arange(
             le_state_or_action_cfg[key].start,

@@ -86,16 +86,54 @@ def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
 
 
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
-    """Set optimizer and scheduler."""
+    """Set optimizer and scheduler.
+
+    cfg.trainer.optimizer.name selects the optimizer:
+      - "AdamW" (default): fused AdamW over the lr groups.
+      - "Muon": 2D matrix (non-embedding) params get torch.optim.Muon updates
+        at cfg.trainer.optimizer.muon_lr; embeddings/non-2D params get AdamW
+        at the group lr (single facade object, see trainer_utils/muon.py).
+        Muon needs FULL per-matrix grads on every rank — run with DeepSpeed
+        ZeRO stage 0 (ACCELERATE_DEEPSPEED_ZERO_STAGE=0), not ZeRO 1/2/3.
+    """
     param_groups = build_param_lr_groups(model=model, cfg=cfg)
-    optimizer = torch.optim.AdamW(
-        param_groups,
-        lr=cfg.trainer.learning_rate.base,
-        betas=tuple(cfg.trainer.optimizer.betas),
-        weight_decay=cfg.trainer.optimizer.weight_decay,
-        eps=cfg.trainer.optimizer.eps,
-        fused=True,
-    )
+    optimizer_name = str(cfg.trainer.optimizer.get("name", "AdamW")).lower()
+
+    if optimizer_name == "muon":
+        from starVLA.training.trainer_utils.muon import MuonAdamW
+
+        muon_lr = float(cfg.trainer.optimizer.get("muon_lr", 0.02))
+        muon_wd = float(cfg.trainer.optimizer.get("muon_weight_decay", 0.0))
+        embedding_param_ids = {
+            id(p) for m in model.modules() if isinstance(m, torch.nn.Embedding) for p in m.parameters()
+        }
+        split_groups = []
+        for group in param_groups:
+            muon_params = [p for p in group["params"] if p.ndim == 2 and id(p) not in embedding_param_ids]
+            adam_params = [p for p in group["params"] if p.ndim != 2 or id(p) in embedding_param_ids]
+            if muon_params:
+                split_groups.append(
+                    {"params": muon_params, "lr": muon_lr, "weight_decay": muon_wd,
+                     "use_muon": True, "name": f"{group.get('name', 'base')}_muon"}
+                )
+            if adam_params:
+                split_groups.append(
+                    {"params": adam_params, "lr": group["lr"], "use_muon": False,
+                     "betas": tuple(cfg.trainer.optimizer.betas),
+                     "eps": cfg.trainer.optimizer.eps,
+                     "weight_decay": cfg.trainer.optimizer.weight_decay,
+                     "name": f"{group.get('name', 'base')}_adam"}
+                )
+        optimizer = MuonAdamW(split_groups)
+    else:
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            lr=cfg.trainer.learning_rate.base,
+            betas=tuple(cfg.trainer.optimizer.betas),
+            weight_decay=cfg.trainer.optimizer.weight_decay,
+            eps=cfg.trainer.optimizer.eps,
+            fused=True,
+        )
 
     if dist.is_initialized() and dist.get_rank() == 0:
         for group in optimizer.param_groups:
@@ -154,7 +192,59 @@ class VLATrainer(TrainerUtils):
             self.vla_train_dataloader,
         )
 
+        self._install_grad_norm_probe()
+        self._unpin_cpu_affinity()
         self._init_wandb()
+
+    def _unpin_cpu_affinity(self):
+        """Widen this rank's CPU affinity back to all CPUs.
+
+        Something in the distributed init pins each rank to its GPU's NUMA
+        node (e.g. cpus 16-31,48-63 for GPUs 4-7). Fork-based dataloader
+        workers inherit that mask, so 4 ranks x N workers end up crammed on
+        16 physical cores while the other half idles, starving the rank's
+        Python/launch thread (VLM forward went 1.4s -> 8s). Must run AFTER
+        distributed init and BEFORE the dataloader workers are forked.
+        """
+        try:
+            n = os.cpu_count()
+            before = os.sched_getaffinity(0)
+            if len(before) < n:
+                os.sched_setaffinity(0, set(range(n)))
+                logger.info(f"CPU affinity widened from {len(before)} to {n} cpus (workers inherit)")
+        except Exception as e:
+            logger.warning(f"could not reset CPU affinity: {e}")
+        # Rank-process-only intra-op threads. Keep OMP_NUM_THREADS=1 in the
+        # environment so forked dataloader workers stay single-threaded
+        # (64 workers x 8 OMP threads previously pushed load avg to ~170).
+        main_threads = int(os.environ.get("STARVLA_MAIN_TORCH_THREADS", "0") or 0)
+        if main_threads > 0:
+            torch.set_num_threads(main_threads)
+            logger.info(f"torch intra-op threads for this rank set to {main_threads}")
+
+    def _install_grad_norm_probe(self):
+        """Accumulate the squared grad norm during backward via hooks.
+
+        Needed because with DeepSpeed accelerator.backward() also runs
+        engine.step(), which zeroes p.grad before the trainer can read it.
+        Hooks fire per-parameter as its grad is finalized, so the sum is
+        complete when backward returns. Norm is pre-clip; at ZeRO-0/DDP the
+        hooked grads are the local (pre/mid-allreduce) grads, which is a
+        fine monitoring signal.
+        """
+        self._grad_sq = None
+
+        def _hook(p):
+            if p.grad is not None:
+                v = p.grad.detach().float().pow(2).sum()
+                self._grad_sq = v if self._grad_sq is None else self._grad_sq + v
+
+        n = 0
+        for p in self.model.parameters():
+            if p.requires_grad:
+                p.register_post_accumulate_grad_hook(_hook)
+                n += 1
+        logger.info(f"grad-norm probe installed on {n} trainable tensors")
 
     def _calculate_total_batch_size(self):
         """Calculate global batch size."""
@@ -358,8 +448,10 @@ class VLATrainer(TrainerUtils):
             if self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
 
-            step_metrics["timing/data"] = t_end_data - t_start_data
-            step_metrics["timing/model"] = t_end_model - t_start_model
+            step_metrics["timing/data_load"] = t_end_data - t_start_data
+            # timing/preprocess (input building on CPU) is reported by the
+            # framework's forward when available; model time excludes it.
+            step_metrics["timing/model"] = (t_end_model - t_start_model) - step_metrics.get("timing/preprocess", 0.0)
             self._log_metrics(step_metrics)
 
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
@@ -373,6 +465,8 @@ class VLATrainer(TrainerUtils):
     def eval_action_model(self, step_metrics: dict = None) -> float:
         """Run simple action-eval on current batch and attach score to metrics."""
         examples = self._get_next_batch()
+        if isinstance(examples, dict) and "examples" in examples:  # prebuilt collate
+            examples = getattr(examples["examples"], "items", examples["examples"])
         actions = [example["action"] for example in examples]
         output_dict = self.accelerator.unwrap_model(self.model).predict_action(
             examples=examples, use_ddim=True, num_ddim_steps=20
@@ -409,12 +503,29 @@ class VLATrainer(TrainerUtils):
                 action_loss = output_dict["action_loss"]
                 total_loss = action_loss
 
+            # Grad-norm probe: under DeepSpeed, accelerator.backward() runs
+            # engine.backward AND engine.step (which zeroes grads), so grads
+            # must be captured DURING backward by the hooks installed in
+            # _install_grad_norm_probe(). Reset the accumulator first.
+            self._grad_sq = None
+            _t_bwd = time.perf_counter()
             self.accelerator.backward(total_loss)
+            torch.cuda.synchronize()
+            _bwd_time = time.perf_counter() - _t_bwd
 
+            # completed_steps increments AFTER this returns, so +1 aligns
+            # with the step number _log_metrics sees. Pre-clip norm.
+            grad_norm = None
+            if (self.completed_steps + 1) % self.config.trainer.logging_frequency == 0 and self._grad_sq is not None:
+                grad_norm = float(self._grad_sq.sqrt())
+
+            _t_opt = time.perf_counter()
             if self.config.trainer.gradient_clipping is not None:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             self.optimizer.step()
+            torch.cuda.synchronize()
+            _opt_time = time.perf_counter() - _t_opt
             # Only step the LR scheduler when gradients are actually synced
             # (i.e., not mid-accumulation). Without this guard the scheduler
             # runs gradient_accumulation_steps times faster than intended,
@@ -423,9 +534,18 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
-        return {
+        metrics = {
             "action_dit_loss": action_loss.item(),
         }
+        if grad_norm is not None:
+            metrics["grad_norm"] = grad_norm
+        metrics["timing/backward"] = _bwd_time
+        metrics["timing/optimizer"] = _opt_time
+        # pass through extra scalar stats from the framework (e.g. wta/*)
+        for k, v in output_dict.items():
+            if k != "action_loss" and isinstance(v, (int, float)):
+                metrics[k] = v
+        return metrics
 
     def _finalize_training(self):
         """Training end processing."""

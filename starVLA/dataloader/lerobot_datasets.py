@@ -48,6 +48,9 @@ def make_LeRobotSingleDataset(
         embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
     
     video_backend = data_cfg.get("video_backend", "decord") if data_cfg else "torchvision_av"
+    # e.g. {num_threads: 1} for decord: ffmpeg auto-threading (num_threads=0)
+    # spawns ~1 thread per core in EVERY dataloader worker and overloads the host.
+    video_backend_kwargs = dict(data_cfg.get("video_backend_kwargs", {}) or {}) if data_cfg else {}
 
     # Opt-in factory hook: a DataConfig may define ``make_dataset(dataset_name=..., **ds_kwargs)``
     # to swap in a custom dataset class (e.g. with per-task filtering / chunk stride).
@@ -70,6 +73,7 @@ def make_LeRobotSingleDataset(
         transforms=transforms,
         embodiment_tag=embodiment_tag,
         video_backend=video_backend, # decord is more efficiency | torchvision_av for video.av1
+        video_backend_kwargs=video_backend_kwargs,
         delete_pause_frame=delete_pause_frame,
         data_cfg=data_cfg,
     )
