@@ -1,0 +1,72 @@
+{
+    "state": {
+        "h1_2.observation.head.joint_position": {
+            "start": 0,
+            "end": 2
+        },
+        "h1_2.observation.body.joint_position": {
+            "start": 2,
+            "end": 37
+        },
+        "h1_2.observation.left_ee.joint_position": {
+            "start": 37,
+            "end": 50
+        },
+        "h1_2.observation.right_ee.joint_position": {
+            "start": 50,
+            "end": 63
+        },
+        "left_arm": {
+            "start": 15,
+            "end": 22
+        },
+        "right_arm": {
+            "start": 22,
+            "end": 29
+        },
+        "legs_waist": {
+            "start": 2,
+            "end": 15
+        },
+        "body_pad": {
+            "start": 29,
+            "end": 37
+        }
+    },
+    "action": {
+        "h1_2.action.head.joint_position": {
+            "start": 0,
+            "end": 2
+        },
+        "h1_2.action.left_arm.joint_position": {
+            "start": 2,
+            "end": 9
+        },
+        "h1_2.action.left_ee.joint_position": {
+            "start": 9,
+            "end": 22
+        },
+        "h1_2.action.right_arm.joint_position": {
+            "start": 22,
+            "end": 29
+        },
+        "h1_2.action.right_ee.joint_position": {
+            "start": 29,
+            "end": 42
+        }
+    },
+    "video": {
+        "front_view": {
+            "original_key": "observation.images.front_view"
+        },
+        "left_wrist_view": {
+            "original_key": "observation.images.left_wrist_view"
+        },
+        "right_wrist_view": {
+            "original_key": "observation.images.right_wrist_view"
+        }
+    },
+    "annotation": {
+        "human.task_description": {}
+    }
+}

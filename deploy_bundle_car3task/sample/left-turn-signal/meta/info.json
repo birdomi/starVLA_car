@@ -1,0 +1,292 @@
+{
+  "chunks_size": 1000,
+  "codebase_version": "v2.0",
+  "created_at": "2026-08-20T04:53:34.009696+00:00",
+  "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+  "features": {
+    "action": {
+      "dtype": "float32",
+      "names": [
+        "position_0",
+        "position_1",
+        "position_2",
+        "position_3",
+        "position_4",
+        "position_5",
+        "position_6",
+        "position_7",
+        "position_8",
+        "position_9",
+        "position_10",
+        "position_11",
+        "position_12",
+        "position_13",
+        "position_14",
+        "position_15",
+        "position_16",
+        "position_17",
+        "position_18",
+        "position_19",
+        "position_20",
+        "position_21",
+        "position_22",
+        "position_23",
+        "position_24",
+        "position_25",
+        "position_26",
+        "position_27",
+        "position_28",
+        "position_29",
+        "position_30",
+        "position_31",
+        "position_32",
+        "position_33",
+        "position_34",
+        "position_35",
+        "position_36",
+        "position_37",
+        "position_38",
+        "position_39",
+        "position_40",
+        "position_41"
+      ],
+      "origin_fields": [
+        "h1_2.action.head.joint_position",
+        "h1_2.action.left_arm.joint_position",
+        "h1_2.action.left_ee.joint_position",
+        "h1_2.action.right_arm.joint_position",
+        "h1_2.action.right_ee.joint_position"
+      ],
+      "shape": [
+        42
+      ]
+    },
+    "annotation.human.task_description": {
+      "dtype": "int64",
+      "names": [
+        "position_0"
+      ],
+      "shape": [
+        1
+      ]
+    },
+    "episode_index": {
+      "dtype": "int64",
+      "names": [
+        "position_0"
+      ],
+      "shape": [
+        1
+      ]
+    },
+    "frame_index": {
+      "dtype": "int64",
+      "names": [
+        "position_0"
+      ],
+      "shape": [
+        1
+      ]
+    },
+    "index": {
+      "dtype": "int64",
+      "names": [
+        "position_0"
+      ],
+      "shape": [
+        1
+      ]
+    },
+    "next.done": {
+      "dtype": "bool",
+      "names": null,
+      "shape": [
+        1
+      ]
+    },
+    "observation.images.front_view": {
+      "dtype": "video",
+      "info": {
+        "has_audio": false,
+        "video.channels": 3,
+        "video.codec": "h264",
+        "video.fps": 20,
+        "video.height": 720,
+        "video.is_depth_map": false,
+        "video.pix_fmt": "yuv420p",
+        "video.width": 1280
+      },
+      "names": [
+        "height",
+        "width",
+        "channel"
+      ],
+      "shape": [
+        720,
+        1280,
+        3
+      ]
+    },
+    "observation.images.left_wrist_view": {
+      "dtype": "video",
+      "info": {
+        "has_audio": false,
+        "video.channels": 3,
+        "video.codec": "h264",
+        "video.fps": 20,
+        "video.height": 480,
+        "video.is_depth_map": false,
+        "video.pix_fmt": "yuv420p",
+        "video.width": 640
+      },
+      "names": [
+        "height",
+        "width",
+        "channel"
+      ],
+      "shape": [
+        480,
+        640,
+        3
+      ]
+    },
+    "observation.images.right_wrist_view": {
+      "dtype": "video",
+      "info": {
+        "has_audio": false,
+        "video.channels": 3,
+        "video.codec": "h264",
+        "video.fps": 20,
+        "video.height": 480,
+        "video.is_depth_map": false,
+        "video.pix_fmt": "yuv420p",
+        "video.width": 640
+      },
+      "names": [
+        "height",
+        "width",
+        "channel"
+      ],
+      "shape": [
+        480,
+        640,
+        3
+      ]
+    },
+    "observation.state": {
+      "dtype": "float32",
+      "names": [
+        "position_0",
+        "position_1",
+        "position_2",
+        "position_3",
+        "position_4",
+        "position_5",
+        "position_6",
+        "position_7",
+        "position_8",
+        "position_9",
+        "position_10",
+        "position_11",
+        "position_12",
+        "position_13",
+        "position_14",
+        "position_15",
+        "position_16",
+        "position_17",
+        "position_18",
+        "position_19",
+        "position_20",
+        "position_21",
+        "position_22",
+        "position_23",
+        "position_24",
+        "position_25",
+        "position_26",
+        "position_27",
+        "position_28",
+        "position_29",
+        "position_30",
+        "position_31",
+        "position_32",
+        "position_33",
+        "position_34",
+        "position_35",
+        "position_36",
+        "position_37",
+        "position_38",
+        "position_39",
+        "position_40",
+        "position_41",
+        "position_42",
+        "position_43",
+        "position_44",
+        "position_45",
+        "position_46",
+        "position_47",
+        "position_48",
+        "position_49",
+        "position_50",
+        "position_51",
+        "position_52",
+        "position_53",
+        "position_54",
+        "position_55",
+        "position_56",
+        "position_57",
+        "position_58",
+        "position_59",
+        "position_60",
+        "position_61",
+        "position_62"
+      ],
+      "origin_fields": [
+        "h1_2.observation.head.joint_position",
+        "h1_2.observation.body.joint_position",
+        "h1_2.observation.left_ee.joint_position",
+        "h1_2.observation.right_ee.joint_position"
+      ],
+      "shape": [
+        63
+      ]
+    },
+    "subtask_index": {
+      "dtype": "int64",
+      "names": [
+        "position_0"
+      ],
+      "shape": [
+        1
+      ]
+    },
+    "task_index": {
+      "dtype": "int64",
+      "names": [
+        "position_0"
+      ],
+      "shape": [
+        1
+      ]
+    },
+    "timestamp": {
+      "dtype": "float64",
+      "names": [
+        "position_0"
+      ],
+      "shape": [
+        1
+      ]
+    }
+  },
+  "fps": 20,
+  "robot_type": "unknown",
+  "splits": {
+    "val": "0:15"
+  },
+  "total_chunks": 1,
+  "total_episodes": 15,
+  "total_frames": 4774,
+  "total_tasks": 1,
+  "total_videos": 45,
+  "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+}
