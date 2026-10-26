@@ -279,8 +279,12 @@ class FlowmatchingActionHead(nn.Module):
         #   sequence so the DiT has dedicated "planning" slots.
         #   num_target_vision_tokens controls how many such tokens are added.
         # ------------------------------------------------------------------
-        self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
-        nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
+        #   0 disables them (no zero-sized parameter, which DDP would flag as never receiving a grad).
+        if int(config.num_target_vision_tokens or 0) > 0:
+            self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
+            nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
+        else:
+            self.future_tokens = None
 
         # ------------------------------------------------------------------
         # Positional embedding over the action sequence
@@ -310,11 +314,19 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=batch)
 
     def forward(
-        self, vl_embs: torch.Tensor, actions: torch.Tensor, state: torch.Tensor = None, encoder_attention_mask=None
+        self,
+        vl_embs: torch.Tensor,
+        actions: torch.Tensor,
+        state: torch.Tensor = None,
+        encoder_attention_mask=None,
+        progress: torch.Tensor = None,
+        memory_states: torch.Tensor = None,
     ):
         """
         vl_embs: shape (B, seq_length, feature_dim)
         actions: shape (B, action_horizon, action_dim)
+        progress: shape (B,) episode progress t / T_episode; required iff the DiT has progress_cond
+        memory_states: shape (B, N_mem, memory_dim) history memory; required iff the DiT has memory_cond
         """
         device = vl_embs.device
 
@@ -340,12 +352,10 @@ class FlowmatchingActionHead(nn.Module):
             action_features = action_features + pos_embs
 
         # state and action embedding along sequence dimension.
-        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-        sa_embs = (
-            torch.cat((state_features, future_tokens, action_features), dim=1)
-            if state_features is not None
-            else torch.cat((future_tokens, action_features), dim=1)
-        )
+        parts = [] if state_features is None else [state_features]
+        if self.future_tokens is not None:
+            parts.append(self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1))
+        sa_embs = torch.cat(parts + [action_features], dim=1)
 
         # Join VLM features with state and action embedding along sequence dimension.
         model_output = self.model(
@@ -354,6 +364,8 @@ class FlowmatchingActionHead(nn.Module):
             encoder_attention_mask=encoder_attention_mask,
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
+            progress=progress,
+            memory_states=memory_states,
         )
         pred = self.action_decoder(model_output)
         pred_actions = pred[:, -actions.shape[1] :]
@@ -368,6 +380,8 @@ class FlowmatchingActionHead(nn.Module):
         vl_embs: torch.Tensor,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
+        progress: torch.Tensor = None,
+        memory_states: torch.Tensor = None,
     ) -> torch.Tensor:
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
@@ -398,12 +412,10 @@ class FlowmatchingActionHead(nn.Module):
                 action_features = action_features + pos_embs
 
             # Join vision, language, state and action embedding along sequence dimension.
-            future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-            sa_embs = (
-                torch.cat((state_features, future_tokens, action_features), dim=1)
-                if state_features is not None
-                else torch.cat((future_tokens, action_features), dim=1)
-            )
+            parts = [] if state_features is None else [state_features]
+            if self.future_tokens is not None:
+                parts.append(self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1))
+            sa_embs = torch.cat(parts + [action_features], dim=1)
 
             # Run model forward.
             model_output = self.model(
@@ -411,6 +423,8 @@ class FlowmatchingActionHead(nn.Module):
                 encoder_hidden_states=vl_embs,
                 encoder_attention_mask=encoder_attention_mask,
                 timestep=timesteps_tensor,
+                progress=progress,
+                memory_states=memory_states,
             )
             pred = self.action_decoder(model_output)
 

@@ -146,18 +146,10 @@ class RegressionActionHead(nn.Module):
       - forward() computes an L1 (default) or MSE regression loss;
         predict_action() is a single forward pass
 
-    Multiple-hypothesis / winner-takes-all mode (num_hypotheses = K > 1):
-      - the DiT still processes only `horizon` action tokens; the K chunks
-        branch off the shared per-step features inside the action decoder
-        (output layer widened to K*action_dim), so extra compute is a few
-        linear ops — negligible vs. the DiT pass. Only the hypothesis
-        closest to GT (per sample) receives the regression loss, so the
-        decoder branches specialise into distinct modes
-      - wta_relax (relaxed WTA, Rupprecht et al.) gives non-winners a small
-        loss weight to prevent dead hypotheses
-      - a score head regresses each hypothesis' L1 error from its (detached)
-        DiT features; at inference the lowest-predicted-error chunk is chosen,
-        keeping one-shot inference while removing mode averaging
+    Single-hypothesis regression only: the winner-takes-all multiple-hypothesis
+    mode (num_hypotheses / wta_relax / score head / per-hypothesis MoE experts)
+    was removed. `moe_expert_layers` survives because the multi-window "experts"
+    mode still uses it as the per-window stack depth.
     """
 
     def __init__(
@@ -189,32 +181,57 @@ class RegressionActionHead(nn.Module):
 
         # "l1" (default) or "mse"
         self.loss_type = getattr(config, "loss_type", "l1")
-        assert self.loss_type in ("l1", "mse"), f"Unsupported loss_type: {self.loss_type}"
+        assert self.loss_type in ("l1", "mse", "l1+l2"), f"Unsupported loss_type: {self.loss_type}"
+        # "l1+l2": l1_weight * L1 + l2_weight * MSE
+        self.l1_weight = float(getattr(config, "l1_weight", 1.0))
+        self.l2_weight = float(getattr(config, "l2_weight", 1.0))
+        # For bidirectional windows: the first num_past_steps slots are PAST
+        # actions, the rest FUTURE. Only used to log past/future errors separately.
+        self.num_past_steps = int(getattr(config, "num_past_steps", 0) or 0)
+        # Multi-window mode: ONE model predicts several bidirectional windows at
+        # once, e.g. [8, 16, 32, 64] -> 120 query slots. Window W owns W slots
+        # (W/2 past + W/2 future) and its target is the centre slice of the
+        # dataset's longest window (action_horizon == max(multi_windows)).
+        self.multi_windows = [int(w) for w in (getattr(config, "multi_windows", None) or [])]
+        # multi_window_mode:
+        #   "experts" (default): shared trunk over max-window slots; one extra
+        #       transformer stack per window (moe_expert_layers blocks, cross-attn
+        #       to vl_embs) takes the trunk's centre W tokens and the shared
+        #       decoder emits that window's trajectory. Output = concat of windows.
+        #   "nested": no extra stacks; window W = centre W slots of the trunk output.
+        #   "separate": each window owns its own trunk slots (sum of windows tokens).
+        self.multi_window_mode = str(getattr(config, "multi_window_mode", "experts"))
+        if self.multi_windows:
+            assert all(w % 2 == 0 for w in self.multi_windows), "windows must be even (half past / half future)"
+            assert max(self.multi_windows) == self.action_horizon, "action_horizon must equal the longest window"
+            assert self.multi_window_mode in ("experts", "nested", "separate")
+            c = self.action_horizon // 2
+            self.window_slices = []  # (pred_lo, pred_hi, tgt_lo, tgt_hi)
+            self.window_trunk_slices = []  # trunk-slot slice feeding each window (experts mode)
+            if self.multi_window_mode == "nested":
+                for w in self.multi_windows:
+                    self.window_slices.append((c - w // 2, c + w // 2, c - w // 2, c + w // 2))
+                self.num_slots = self.action_horizon
+            elif self.multi_window_mode == "experts":
+                start = 0
+                for w in self.multi_windows:
+                    self.window_slices.append((start, start + w, c - w // 2, c + w // 2))
+                    self.window_trunk_slices.append((c - w // 2, c + w // 2))
+                    start += w
+                self.num_slots = self.action_horizon  # trunk slots
+            else:  # separate
+                start = 0
+                for w in self.multi_windows:
+                    self.window_slices.append((start, start + w, c - w // 2, c + w // 2))
+                    start += w
+                self.num_slots = start
+        else:
+            self.window_slices = None
+            self.num_slots = self.action_horizon
 
-        # ------------------------------------------------------------------
-        # Winner-takes-all multiple hypotheses
-        #   num_hypotheses: K chunks per sample (1 = plain regression).
-        #   wta_relax: ε weight on non-winner hypotheses (0.05 is a common
-        #     choice; 0.0 = hard WTA, risks dead hypotheses).
-        #   score_loss_coeff: weight of the score-head regression loss.
-        # ------------------------------------------------------------------
-        self.num_hypotheses = int(getattr(config, "num_hypotheses", 8))
-        self.wta_relax = float(getattr(config, "wta_relax", 0.05))
-        self.score_loss_coeff = float(getattr(config, "score_loss_coeff", 1.0))
-
-        # MoE hypothesis branch:
-        #   moe_expert_layers = 0: hypotheses branch only in the decoder's
-        #     last linear layer (cheapest).
-        #   moe_expert_layers = L > 0 (default 1): the shared DiT trunk is
-        #     followed by K expert stacks of L transformer blocks each
-        #     (cross-attending to vl_embs), giving every hypothesis
-        #     attention-level capacity; actions are decoded from each
-        #     expert's features by ONE shared decoder.
-        #     Extra cost ≈ K*L / num_layers of one DiT pass.
-        #   WTA acts as the GT-based router in training; the score head is
-        #   the router at inference — no gating network needed.
+        # Per-window expert stack depth (multi_window_mode == "experts"):
+        # L transformer blocks per window on top of the shared DiT trunk.
         self.moe_expert_layers = int(getattr(config, "moe_expert_layers", 1))
-        self.use_moe = self.num_hypotheses > 1 and self.moe_expert_layers > 0
 
         self.state_encoder = (
             MLP(
@@ -229,18 +246,16 @@ class RegressionActionHead(nn.Module):
         # Learnable per-step query tokens replace the noised-action encoding.
         # They are position-specific, so no extra positional embedding is needed
         # on top (the DiT blocks also carry sinusoidal positions internally).
-        # The DiT sequence length is independent of K: hypotheses branch off
-        # the shared per-step features in the decoder below.
-        self.action_queries = nn.Embedding(self.action_horizon, self.input_embedding_dim)
+        self.action_queries = nn.Embedding(self.num_slots, self.input_embedding_dim)
         nn.init.normal_(self.action_queries.weight, mean=0.0, std=0.02)
 
-        # K expert transformer stacks on top of the shared DiT trunk
-        # (only in MoE mode). Each expert sees the trunk's pre-output hidden
-        # states and cross-attends to vl_embs like a regular DiT block; the
-        # trunk's norm_out/proj_out are reused per expert.
-        if self.use_moe:
+        # Window experts (multi_window_mode == "experts"): one transformer stack
+        # per window on top of the shared trunk, same block as the MoE experts.
+        self.use_window_experts = bool(self.multi_windows) and self.multi_window_mode == "experts"
+        if self.use_window_experts:
+            assert self.moe_expert_layers > 0, "set moe_expert_layers >= 1 for window experts"
             mcfg = self.model.config
-            self.expert_blocks = nn.ModuleList(
+            self.window_experts = nn.ModuleList(
                 [
                     nn.ModuleList(
                         [
@@ -263,39 +278,29 @@ class RegressionActionHead(nn.Module):
                             for _ in range(self.moe_expert_layers)
                         ]
                     )
-                    for _ in range(self.num_hypotheses)
+                    for _ in self.multi_windows
                 ]
             )
         else:
-            self.expert_blocks = None
+            self.window_experts = None
 
-        # Action decoder:
-        #   MoE mode: shared decoder applied to each expert's features (-> A).
-        #   Linear-branch mode: shared hidden, K-way output (-> K*A).
+        # Action decoder: per-slot features -> action_dim.
         self.action_decoder = MLP(
             input_dim=self.model.config.output_dim,
             hidden_dim=self.hidden_size,
-            output_dim=self.action_dim if self.use_moe else self.num_hypotheses * self.action_dim,
-        )
-
-        # Score head: regresses every hypothesis' mean L1 error from mean-
-        # pooled action features (per-expert features in MoE mode, shared
-        # features otherwise). Inputs are detached so it acts purely as a
-        # selector and never shapes the backbone.
-        self.score_head = (
-            MLP(
-                input_dim=self.model.config.output_dim,
-                hidden_dim=self.hidden_size,
-                output_dim=1 if self.use_moe else self.num_hypotheses,
-            )
-            if self.num_hypotheses > 1
-            else None
+            output_dim=self.action_dim,
         )
 
         # Learnable "planning" tokens prepended before the action queries,
         # kept from GR00T so the DiT has dedicated scratch slots.
-        self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
-        nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
+        # num_target_vision_tokens = 0 disables them (they carry no loss here:
+        # GR00T used them for FLARE future-prediction, which is off).
+        self.num_future_tokens = int(getattr(config, "num_target_vision_tokens", 0) or 0)
+        if self.num_future_tokens > 0:
+            self.future_tokens = nn.Embedding(self.num_future_tokens, self.input_embedding_dim)
+            nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
+        else:
+            self.future_tokens = None
 
         self.config = config
 
@@ -304,62 +309,66 @@ class RegressionActionHead(nn.Module):
 
     def _build_sa_embs(self, batch_size: int, state: torch.Tensor = None) -> torch.Tensor:
         """Assemble [state | future_tokens | action_queries] along the sequence dim."""
-        action_features = self.action_queries.weight.unsqueeze(0).expand(batch_size, -1, -1)
-        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(batch_size, -1, -1)
-        state_features = self.state_encoder(state) if state is not None else None
-        return (
-            torch.cat((state_features, future_tokens, action_features), dim=1)
-            if state_features is not None
-            else torch.cat((future_tokens, action_features), dim=1)
-        )
+        parts = []
+        if state is not None and self.state_encoder is not None:
+            parts.append(self.state_encoder(state))
+        if self.future_tokens is not None:
+            parts.append(self.future_tokens.weight.unsqueeze(0).expand(batch_size, -1, -1))
+        parts.append(self.action_queries.weight.unsqueeze(0).expand(batch_size, -1, -1))
+        return torch.cat(parts, dim=1)
 
-    def _run_hypotheses(self, vl_embs: torch.Tensor, state: torch.Tensor, encoder_attention_mask):
-        """One shared-trunk DiT pass over `horizon` action tokens.
+    def _run(self, vl_embs: torch.Tensor, state: torch.Tensor, encoder_attention_mask):
+        """One DiT pass over the action slots.
 
-        pred_actions: (B, K, horizon, action_dim)
-        action_feats: (B, K, horizon, D) in MoE mode (per-expert features),
-                      (B, horizon, D) otherwise (shared across hypotheses)
+        pred_actions: (B, num_slots, action_dim)
+        action_feats: (B, num_slots, D)
         """
         B = vl_embs.shape[0]
         sa_embs = self._build_sa_embs(B, state).to(dtype=vl_embs.dtype)
 
-        if self.use_moe:
+        if self.use_window_experts:
             trunk = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
                 encoder_attention_mask=encoder_attention_mask,
                 return_pre_output=True,
-            )  # (B, T, inner_dim)
-            expert_feats = []
-            for expert in self.expert_blocks:
-                h = trunk
+            )[:, -self.num_slots :]  # (B, 64, inner): the trunk's action slots
+            feats, preds = [], []
+            for expert, (lo, hi) in zip(self.window_experts, self.window_trunk_slices):
+                h = trunk[:, lo:hi]  # centre W tokens
                 for blk in expert:
-                    h = blk(
-                        h,
-                        encoder_hidden_states=vl_embs,
-                        encoder_attention_mask=encoder_attention_mask,
-                    )
-                h = self.model.proj_out(self.model.norm_out(h))  # shared output proj
-                expert_feats.append(h[:, -self.action_horizon :])
-            action_feats = torch.stack(expert_feats, dim=1)  # (B, K, H, D)
-            pred_actions = self.action_decoder(action_feats)  # (B, K, H, A)
-            return pred_actions, action_feats
+                    h = blk(h, encoder_hidden_states=vl_embs, encoder_attention_mask=encoder_attention_mask)
+                h = self.model.proj_out(self.model.norm_out(h))
+                feats.append(h)
+                preds.append(self.action_decoder(h))
+            return torch.cat(preds, dim=1), torch.cat(feats, dim=1)  # (B, sum(W), A), (B, sum(W), D)
 
         model_output = self.model(
             hidden_states=sa_embs,
             encoder_hidden_states=vl_embs,
             encoder_attention_mask=encoder_attention_mask,
         )
-        action_feats = model_output[:, -self.action_horizon :]  # (B, H, D)
-        pred = self.action_decoder(action_feats)  # (B, H, K*A)
-        pred_actions = pred.reshape(B, self.action_horizon, self.num_hypotheses, self.action_dim).permute(0, 2, 1, 3)
-        return pred_actions, action_feats
+        action_feats = model_output[:, -self.num_slots :]  # (B, S, D)
+        return self.action_decoder(action_feats), action_feats  # (B, S, A), (B, S, D)
 
-    def _score_hypotheses(self, action_feats: torch.Tensor) -> torch.Tensor:
-        """Predict each hypothesis' error from action features -> (B, K)."""
-        if self.use_moe:
-            return self.score_head(action_feats.mean(dim=2)).squeeze(-1)  # per-expert pooled
-        return self.score_head(action_feats.mean(dim=1))  # shared pooled, K-way output
+    def expand_targets(self, actions: torch.Tensor) -> torch.Tensor:
+        """(B, action_horizon, A) dataset window -> (B, num_slots, A) slot targets."""
+        if self.window_slices is None or self.multi_window_mode == "nested":
+            return actions  # nested: slots == dataset window
+        return torch.cat([actions[:, tlo:thi] for (_, _, tlo, thi) in self.window_slices], dim=1)
+
+    def split_windows(self, pred: torch.Tensor) -> dict:
+        """(B, num_slots, A) -> {window: (B, window, A)} (past half first)."""
+        if self.window_slices is None:
+            return {self.action_horizon: pred}
+        return {w: pred[:, lo:hi] for w, (lo, hi, _, _) in zip(self.multi_windows, self.window_slices)}
+
+    def _regression_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self.loss_type == "l1":
+            return F.l1_loss(pred, target)
+        if self.loss_type == "mse":
+            return F.mse_loss(pred, target)
+        return self.l1_weight * F.l1_loss(pred, target) + self.l2_weight * F.mse_loss(pred, target)
 
     def forward(
         self, vl_embs: torch.Tensor, actions: torch.Tensor, state: torch.Tensor = None, encoder_attention_mask=None
@@ -368,42 +377,32 @@ class RegressionActionHead(nn.Module):
         vl_embs: shape (B, seq_length, feature_dim)
         actions: shape (B, action_horizon, action_dim)
         """
-        pred_actions, action_feats = self._run_hypotheses(vl_embs, state, encoder_attention_mask)
+        pred, _ = self._run(vl_embs, state, encoder_attention_mask)  # (B, S, A)
 
-        if self.num_hypotheses == 1:
-            pred = pred_actions[:, 0]
-            if self.loss_type == "l1":
-                return F.l1_loss(pred, actions)
-            return F.mse_loss(pred, actions)
+        if self.window_slices is not None:
+            # per-window loss (each window weighted equally), targets sliced
+            # from the centre of the dataset window
+            losses, stats = [], {}
+            for w, (lo, hi, tlo, thi) in zip(self.multi_windows, self.window_slices):
+                pw, tw = pred[:, lo:hi], actions[:, tlo:thi]
+                losses.append(self._regression_loss(pw, tw))
+                with torch.no_grad():
+                    d = (pw - tw).abs()
+                    stats[f"loss/w{w}_l1"] = float(d.mean())
+                    stats[f"loss/w{w}_past_l1"] = float(d[:, : w // 2].mean())
+                    stats[f"loss/w{w}_future_l1"] = float(d[:, w // 2 :].mean())
+            self.last_wta_stats = stats
+            return torch.stack(losses).mean()
 
-        # Per-hypothesis error vs GT: (B, K)
-        diff = pred_actions - actions.unsqueeze(1)
-        errors = diff.abs().mean(dim=(2, 3)) if self.loss_type == "l1" else diff.pow(2).mean(dim=(2, 3))
-
-        # Winner-takes-all: backprop only through the closest hypothesis,
-        # plus ε-weighted loss on the others (relaxed WTA).
-        winner = errors.argmin(dim=1)  # (B,)
-        winner_loss = errors.gather(1, winner[:, None]).mean()
-        loss = winner_loss
-        if self.wta_relax > 0 and self.num_hypotheses > 1:
-            others_loss = (errors.sum(dim=1) - errors.gather(1, winner[:, None]).squeeze(1)).mean() / (
-                self.num_hypotheses - 1
-            )
-            loss = winner_loss + self.wta_relax * others_loss
-
-        # Score head learns to predict each hypothesis' L1 error (selector).
-        # Detached on both sides: gradients touch only the score head.
-        score_target = pred_actions.detach().sub(actions.unsqueeze(1)).abs().mean(dim=(2, 3))  # (B, K)
-        pred_scores = self._score_hypotheses(action_feats.detach())  # (B, K)
-        score_loss = F.mse_loss(pred_scores, score_target)
-
-        # lightweight per-batch stats for trainer logging (no grad)
-        self.last_wta_stats = {
-            "wta/unique_winners": int(winner.unique().numel()),
-            "wta/score_loss": float(score_loss.detach()),
-        }
-
-        return loss + self.score_loss_coeff * score_loss
+        loss = self._regression_loss(pred, actions)
+        with torch.no_grad():
+            stats = {}
+            if 0 < self.num_past_steps < pred.shape[1]:
+                d = (pred - actions).abs()
+                stats["loss/past_l1"] = float(d[:, : self.num_past_steps].mean())
+                stats["loss/future_l1"] = float(d[:, self.num_past_steps :].mean())
+            self.last_wta_stats = stats
+        return loss
 
     @torch.no_grad()
     def predict_action(
@@ -411,21 +410,10 @@ class RegressionActionHead(nn.Module):
         vl_embs: torch.Tensor,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
-        return_all_hypotheses: bool = False,
+        **kwargs,
     ) -> torch.Tensor:
-        pred_actions, action_feats = self._run_hypotheses(vl_embs, state, encoder_attention_mask)
-
-        if self.num_hypotheses == 1:
-            return pred_actions[:, 0]
-
-        # Pick the hypothesis with the lowest predicted error.
-        pred_scores = self._score_hypotheses(action_feats)  # (B, K)
-        best = pred_scores.argmin(dim=1)  # (B,)
-        chosen = pred_actions[torch.arange(pred_actions.shape[0], device=pred_actions.device), best]
-
-        if return_all_hypotheses:
-            return chosen, pred_actions, pred_scores
-        return chosen
+        pred, _ = self._run(vl_embs, state, encoder_attention_mask)
+        return pred
 
     @property
     def device(self):
@@ -438,12 +426,23 @@ class RegressionActionHead(nn.Module):
 
 def get_action_model(config=None):
     """
-    Factory: build RegressionActionHead from global framework config.
+    Factory: build a regression, Gaussian-field, or direct action-splat head.
 
     Args:
         config: Global config (expects config.framework.action_model namespace).
 
     Returns:
-        RegressionActionHead: Initialized regression action head.
+        nn.Module: Head selected by action_model.head_type (default regression).
     """
+    head_type = config.framework.action_model.get("head_type", "regression")
+    if head_type == "action_splat":
+        from starVLA.model.modules.action_model.ActionSplatHead import ActionSplatHead
+
+        return ActionSplatHead(full_config=config)
+    if head_type == "gaussian":
+        from starVLA.model.modules.action_model.Gaussian_ActionHeader import GaussianActionHead
+
+        return GaussianActionHead(full_config=config)
+    if head_type != "regression":
+        raise ValueError(f"Unknown regressor head_type: {head_type}")
     return RegressionActionHead(full_config=config)

@@ -14,6 +14,8 @@
 # limitations under the License.
 
 
+import os
+
 import av
 import cv2
 import numpy as np
@@ -42,7 +44,9 @@ except (ImportError, RuntimeError):
 # Requires DataLoader workers with a "spawn" multiprocessing context: CUDA
 # cannot be (re)initialized in a forked worker.
 _CUDA_DECODER_CACHE: "dict[str, object]" = {}
-_CUDA_DECODER_CACHE_CAP = 4
+# STARVLA_CUDA_DECODER_CACHE raises it when the decoders are cheap and the files many (car-turn-signal:
+# 351 files, ~20 MiB per 720p decoder, ~6 MiB per 480p one; a miss costs ~70 ms CPU to build a decoder).
+_CUDA_DECODER_CACHE_CAP = int(os.environ.get("STARVLA_CUDA_DECODER_CACHE", "4"))
 
 # Per-process cache of decord readers + their frame-timestamp tables.
 # Keyed by path; kwargs are effectively constant per run.

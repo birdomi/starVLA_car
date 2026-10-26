@@ -161,10 +161,22 @@ def _normalize_action_mode_state_map(action_mode_state_map: dict[str, str] | Non
 
 def _build_stats_cache_config(
     action_mode: str,
+    action_mode_apply_keys: Sequence[str] | None = None,
+    action_mode_state_map: dict[str, str] | None = None,
 ) -> dict:
-    return {
-        "mode": action_mode,
-    }
+    config: dict = {"mode": action_mode}
+    # `abs` statistics come straight off the raw action columns, so the apply
+    # keys and the anchor map cannot change them. For `rel`/`delta` they do:
+    # a key listed in apply_keys accumulates residuals and every other key keeps
+    # its absolute values in the same statistics blob (see
+    # calculate_rel_action_statistics). Two runs that differ only in which keys
+    # are anchored therefore need different statistics, and keying the cache on
+    # the mode alone silently hands the second run the first run's ranges —
+    # normalizing a whole channel group against a range it never belonged to.
+    if action_mode != "abs":
+        config["apply_keys"] = sorted(action_mode_apply_keys or [])
+        config["state_map"] = dict(sorted((action_mode_state_map or {}).items()))
+    return config
 
 
 def _invalidate_legacy_stats_cache(stats_path: Path, reason: str) -> None:
@@ -210,6 +222,25 @@ def _load_stats_cache(
         return None
 
     return statistics
+
+
+def _resolve_mode_stats_path(dataset_path: Path, action_mode: str, cache_config: dict) -> Path:
+    """Per-action-mode statistics cache: meta/stats_gr00t.<mode>.json.
+
+    The legacy single file (meta/stats_gr00t.json) was invalidated and
+    rebuilt whenever a run used a different action_mode on the same dataset,
+    thrashing between e.g. delta and rel (a full pass over all parquets).
+    If the legacy file exists and its config matches this mode, it is
+    migrated (copied) to the mode-specific name; it is never deleted here.
+    """
+    legacy_path = dataset_path / LE_ROBOT_STATS_FILENAME
+    mode_path = legacy_path.with_name(f"stats_gr00t.{action_mode}.json")
+    if not mode_path.exists() and legacy_path.exists():
+        legacy_stats = _load_stats_cache(legacy_path, cache_config, invalidate_legacy=False)
+        if legacy_stats is not None:
+            _save_stats_cache(mode_path, cache_config, legacy_stats)
+            print(f"[stats] migrated legacy statistics cache -> {mode_path.name}")
+    return mode_path
 
 
 def _save_stats_cache(stats_path: Path, cache_config: dict, statistics: dict) -> None:
@@ -436,10 +467,17 @@ def calculate_delta_action_statistics(
                     if action_part_chunk.shape[1] != state_chunk.shape[1]:
                         raise ValueError(f"Action/state dim mismatch for {action_col}:{a_slice}")
 
+                    # bidirectional delta anchored at relative index 0 (matches
+                    # LeRobotSingleDataset._apply_action_mode; p0 == 0 for
+                    # future-only windows -> original behaviour)
+                    _ai = np.asarray(action_indices)
+                    p0 = int(np.flatnonzero(_ai == 0)[0]) if (_ai == 0).any() else 0
                     out = action_part_chunk.copy()
-                    if len(out) > 1:
-                        out[1:] = action_part_chunk[1:] - action_part_chunk[:-1]
-                    out[0] = action_part_chunk[0] - state_chunk[0]
+                    if len(out) > p0 + 1:
+                        out[p0 + 1 :] = action_part_chunk[p0 + 1 :] - action_part_chunk[p0:-1]
+                    out[p0] = action_part_chunk[p0] - state_chunk[0]
+                    if p0 > 0:
+                        out[:p0] = action_part_chunk[:p0] - action_part_chunk[1 : p0 + 1]
                     action_chunk_full[:, a_slice[0] : a_slice[1]] = out
 
                 accum[action_col].append(action_chunk_full)
@@ -636,6 +674,53 @@ class LeRobotSingleDataset(Dataset):
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
         self._all_steps = self._get_all_steps()
+        # Optional per-dataset episode cap (data_cfg.max_episodes_per_dataset): keep only the FIRST N
+        # episodes, deterministically, for fast small-data experiments (e.g. RoboCasa-100 out of the
+        # _1000 datasets). The steps_data_index.pkl cache covers ALL episodes, so the step list must be
+        # filtered too. Normalization statistics are untouched (still the full-dataset stats), which
+        # keeps action/state scaling identical to full-data runs.
+        # data_cfg.skip_first_episodes: drop the first K episodes before the cap, e.g. K=900 + cap 100 = the last
+        # 100 of each _1000 dataset, a held-out set disjoint from a "first 100" training subset.
+        _ep_skip = int(self.data_cfg.get("skip_first_episodes", 0) or 0) if self.data_cfg else 0
+        if _ep_skip:
+            self._trajectory_ids = self._trajectory_ids[_ep_skip:]
+            self._trajectory_lengths = self._trajectory_lengths[_ep_skip:]
+            _keep = {int(t) for t in np.asarray(self._trajectory_ids).tolist()}
+            self._all_steps = [st for st in self._all_steps if int(st[0]) in _keep]
+        _ep_cap = int(self.data_cfg.get("max_episodes_per_dataset", 0) or 0) if self.data_cfg else 0
+        if _ep_cap and len(self._trajectory_ids) > _ep_cap:
+            self._trajectory_ids = self._trajectory_ids[:_ep_cap]
+            self._trajectory_lengths = self._trajectory_lengths[:_ep_cap]
+            _keep = {int(t) for t in np.asarray(self._trajectory_ids).tolist()}
+            _before = len(self._all_steps)
+            self._all_steps = [st for st in self._all_steps if int(st[0]) in _keep]
+            if int(os.environ.get("RANK", "0")) == 0:
+                print(
+                    f"[max_episodes_per_dataset={_ep_cap}] {self.dataset_name}: "
+                    f"episodes -> {len(self._trajectory_ids)}, steps {_before} -> {len(self._all_steps)}"
+                )
+        # Optional minimum episode length in frames (data_cfg.min_episode_length): drops aborted /
+        # truncated recordings (e.g. car-few-tasks-v1 has 1.6-5 s episodes where the task never
+        # finished). Like the cap above, only the step list is filtered; statistics are untouched.
+        # data_cfg.exclude_episodes: explicit episode ids to drop (e.g. bad on video). Ids are
+        # per dataset, so only use it with single-dataset mixtures.
+        _min_len = int(self.data_cfg.get("min_episode_length", 0) or 0) if self.data_cfg else 0
+        _exclude = {int(e) for e in (self.data_cfg.get("exclude_episodes", None) or [])} if self.data_cfg else set()
+        if _min_len or _exclude:
+            _ids = np.asarray(self._trajectory_ids)
+            _lens = np.asarray(self._trajectory_lengths)
+            _mask = (_lens >= _min_len) & ~np.isin(_ids.astype(np.int64), list(_exclude))
+            if not _mask.all():
+                self._trajectory_ids = _ids[_mask]
+                self._trajectory_lengths = _lens[_mask]
+                _keep = {int(t) for t in self._trajectory_ids.tolist()}
+                _before = len(self._all_steps)
+                self._all_steps = [st for st in self._all_steps if int(st[0]) in _keep]
+                if int(os.environ.get("RANK", "0")) == 0:
+                    print(
+                        f"[min_episode_length={_min_len}, exclude={sorted(_exclude)}] {self.dataset_name}: dropped {int((~_mask).sum())} "
+                        f"episodes -> {len(self._trajectory_ids)}, steps {_before} -> {len(self._all_steps)}"
+                    )
         self.set_transforms_metadata(self.metadata)
         self.set_epoch(0)
 
@@ -829,7 +914,15 @@ class LeRobotSingleDataset(Dataset):
         )
         stats_cache_config = _build_stats_cache_config(
             action_mode=action_mode,
+            action_mode_apply_keys=apply_keys,
+            action_mode_state_map=normalized_state_map,
         )
+        # per-mode cache file (see _resolve_mode_stats_path); rank 0 migrates
+        # a matching legacy file, other ranks pick it up after the barrier.
+        if is_main():
+            stats_path = _resolve_mode_stats_path(self.dataset_path, action_mode, stats_cache_config)
+        else:
+            stats_path = (self.dataset_path / LE_ROBOT_STATS_FILENAME).with_name(f"stats_gr00t.{action_mode}.json")
         parquet_files = list(self.dataset_path.glob(LE_ROBOT_DATA_FILENAME))
         parquet_files_filtered = [
             pf for pf in parquet_files if "episode_033675.parquet" not in pf.name
@@ -1200,6 +1293,14 @@ class LeRobotSingleDataset(Dataset):
         for config in self.modality_configs.values():
             for key in config.modality_keys:
                 delta_indices[key] = np.array(config.delta_indices)
+        # Optional per-key override so a single camera can carry history while
+        # the others stay single-frame, e.g. in the train yaml:
+        #   delta_indices_override: {"video.front_view": [-5, 0]}
+        override = self.data_cfg.get("delta_indices_override", None) if self.data_cfg else None
+        for key, idxs in dict(override or {}).items():
+            if key not in delta_indices:
+                raise KeyError(f"delta_indices_override key {key!r} is not a configured modality key")
+            delta_indices[key] = np.array(list(idxs))
         return delta_indices
 
     def _init_action_mode(self) -> None:
@@ -1262,10 +1363,20 @@ class LeRobotSingleDataset(Dataset):
 
             state0 = state_values[0]
             if self._action_mode == "delta":
+                # Bidirectional delta anchored at the current step t (the slot
+                # whose relative index is 0; p0 == 0 for future-only windows,
+                # which reproduces the original behaviour exactly):
+                #   future side: out[p0] = a[t] - s[t], out[i] = a[i] - a[i-1]  (i > p0)
+                #   past side:   out[i] = a[i] - a[i+1]                          (i < p0)
+                # so every slot is a one-step displacement pointing away from t.
                 out = action_values.copy()
-                if len(out) > 1:
-                    out[1:] = action_values[1:] - action_values[:-1]
-                out[0] = action_values[0] - state0
+                idx = self.delta_indices.get(action_key) if hasattr(self, "delta_indices") else None
+                p0 = int(np.flatnonzero(np.asarray(idx) == 0)[0]) if idx is not None and (np.asarray(idx) == 0).any() else 0
+                if len(out) > p0 + 1:
+                    out[p0 + 1 :] = action_values[p0 + 1 :] - action_values[p0:-1]
+                out[p0] = action_values[p0] - state0
+                if p0 > 0:
+                    out[:p0] = action_values[:p0] - action_values[1 : p0 + 1]
             elif self._action_mode == "rel":
                 out = action_values - state0
             else:
@@ -1319,6 +1430,19 @@ class LeRobotSingleDataset(Dataset):
             df = df.reset_index()  # convert index to a column, typically named 'index'
             df = df.rename(columns={'index': 'task'})  # rename 'index' column to 'task'
             df = df[['task_index', 'task']]  # reorder columns
+            # get_language looks tasks up with .loc[task_index]; index by task_index so that
+            # does not silently depend on the file's row order.
+            df = df.set_index('task_index', drop=False)
+            # Optional instruction rewrite (data_cfg.task_text_replace: {old: new}), e.g.
+            # {" (fixed seat)": ""} merges the fixed-seat variants of car-few-tasks-v1 into
+            # their base instruction. The data files are untouched.
+            _replace = dict(self.data_cfg.get("task_text_replace", {}) or {}) if self.data_cfg else {}
+            if _replace:
+                before = df['task'].nunique()
+                for old, new in _replace.items():
+                    df['task'] = df['task'].str.replace(old, new, regex=False)
+                if int(os.environ.get("RANK", "0")) == 0:
+                    print(f"[task_text_replace] {self.dataset_name}: {before} -> {df['task'].nunique()} distinct instructions")
             return df
     def _check_integrity(self):
         """Use the config to check if the keys are valid and detect silent data corruption."""
@@ -1373,15 +1497,63 @@ class LeRobotSingleDataset(Dataset):
         trajectory_id, base_index = self.all_steps[index]
         raw_data = self.get_step_data(trajectory_id, base_index)
         data = self.transforms(raw_data)
-        return self._pack_sample(data)
+        return self._pack_sample(data, trajectory_id=trajectory_id, base_index=base_index)
 
-    def _pack_sample(self, data: dict) -> dict:
+    def _episode_progress(self, trajectory_id: int, base_index: int) -> float:
+        """base_index / (episode_length - 1), clipped to [0, 1].
+
+        Normalized progress rather than the absolute frame index: the same task
+        is demonstrated at very different speeds (20.6-36.2 s per episode on
+        car-left-turn-signal), so the raw index largely encodes how fast the
+        operator moved, while t/T is invariant to that.
+        """
+        idx = int(np.nonzero(self.trajectory_ids == trajectory_id)[0][0])
+        length = int(self.trajectory_lengths[idx])
+        return float(np.clip(base_index / max(length - 1, 1), 0.0, 1.0))
+
+    @staticmethod
+    def _color_jitter(images: list, cfg: dict) -> list:
+        """Apply one ColorJitter draw (brightness / contrast / saturation / hue, torchvision semantics) to all images."""
+        import torchvision.transforms as T
+        import torchvision.transforms.functional as TF
+
+        cj = T.ColorJitter(brightness=float(cfg.get("brightness", 0.0)), contrast=float(cfg.get("contrast", 0.0)),
+                           saturation=float(cfg.get("saturation", 0.0)), hue=float(cfg.get("hue", 0.0)))
+        order, b, c, s, h = cj.get_params(cj.brightness, cj.contrast, cj.saturation, cj.hue)
+        out = []
+        for img in images:
+            for fn_id in order:
+                if fn_id == 0 and b is not None:
+                    img = TF.adjust_brightness(img, b)
+                elif fn_id == 1 and c is not None:
+                    img = TF.adjust_contrast(img, c)
+                elif fn_id == 2 and s is not None:
+                    img = TF.adjust_saturation(img, s)
+                elif fn_id == 3 and h is not None:
+                    img = TF.adjust_hue(img, h)
+            out.append(img)
+        return out
+
+    def _pack_sample(self, data: dict, trajectory_id: int = None, base_index: int = None) -> dict:
         """Pack transformed modality data into training sample format."""
+        # Every frame of the video window (delta_indices order, oldest first)
+        # becomes one image for the VLM, so a data config with video
+        # delta_indices [-15, 0] yields [frame(t-15), frame(t)]. The size comes
+        # from datasets.vla_data.obs_image_size as (W, H) — default 224x224;
+        # a 16:9 size such as [352, 192] keeps the aspect ratio of 640x360 video.
         step_images = []
+        size = self.data_cfg.get("obs_image_size", None) if self.data_cfg is not None else None
+        size = (int(size[0]), int(size[-1])) if size else (224, 224)
         for video_key in self.modality_keys["video"]:
-            image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
-            step_images.append(image)
+            for image in data[video_key]:
+                step_images.append(Image.fromarray(image).resize(size))
+        # Optional photometric augmentation (datasets.<split>.color_jitter: {brightness, contrast, saturation, hue},
+        # torchvision ColorJitter ranges). ONE random draw per sample, applied to every camera and every time offset,
+        # i.e. a global exposure / white-balance shift as between the collection and a deployment camera setup.
+        # Only the split that lists the key is augmented (the val split / eval scripts never do).
+        jitter = self.data_cfg.get("color_jitter", None) if self.data_cfg is not None else None
+        if jitter:
+            step_images = self._color_jitter(step_images, jitter)
 
         language = data[self.modality_keys["language"][0]][0]
         action = []
@@ -1411,6 +1583,52 @@ class LeRobotSingleDataset(Dataset):
             else:
                 state = np.concatenate(state, axis=1).astype(np.float16)
                 sample["state"] = state
+
+        # Auxiliary target for progress-predicting heads. Off by default so
+        # every existing framework sees exactly the sample it saw before.
+        if (
+            self.data_cfg is not None
+            and self.data_cfg.get("emit_progress", False) not in ["False", False]
+            and trajectory_id is not None
+        ):
+            sample["progress"] = np.float32(self._episode_progress(trajectory_id, base_index))
+
+        # Frame bookkeeping for frameworks with future-frame targets (QwenLatentWorldAction). Off by default.
+        #   frame_offsets: requested video delta of every image, in "image" order (checked against the model's layout)
+        #   frame_keys:    dataset/camera/episode/<absolute frame actually loaded> (feature-cache keys)
+        #   future_valid:  False if any video index fell outside the episode and was clamped by get_video to its
+        #                  first / last frame (never another episode) -> such a "future" is not t + offset
+        #   sample_key:    dataset/episode/base_index
+        if (
+            self.data_cfg is not None
+            and self.data_cfg.get("emit_frame_meta", False) not in ["False", False]
+            and trajectory_id is not None
+        ):
+            length = int(self.trajectory_lengths[self.get_trajectory_index(trajectory_id)])
+            offsets, keys = [], []
+            for video_key in self.modality_keys["video"]:
+                for delta in self.delta_indices[video_key]:
+                    offsets.append(int(delta))
+                    frame = min(max(int(base_index) + int(delta), 0), length - 1)
+                    keys.append(f"{self.dataset_name}/{video_key.replace('video.', '')}/{int(trajectory_id)}/{frame}")
+            sample["frame_offsets"] = np.asarray(offsets, dtype=np.int64)
+            sample["frame_keys"] = keys
+            sample["future_valid"] = bool(all(0 <= int(base_index) + o <= length - 1 for o in offsets))
+            sample["sample_key"] = f"{self.dataset_name}/{int(trajectory_id)}/{int(base_index)}"
+
+        # Per-slot validity for windows that reach outside the episode (QwenGR00T_DualSystem). Off by default.
+        #   action_valid [T_a]: base_index + delta lies inside the episode, per action delta (False = padded slot,
+        #                       filled with the first / last action by retrieve_data_and_pad)
+        #   frame_valid  [T_v]: the same per video delta (get_video clamps such frames to the first / last frame)
+        if (
+            self.data_cfg is not None
+            and self.data_cfg.get("emit_action_valid", False) not in ["False", False]
+            and trajectory_id is not None
+        ):
+            length = int(self.trajectory_lengths[self.get_trajectory_index(trajectory_id)])
+            inside = lambda deltas: np.array([0 <= int(base_index) + int(d) < length for d in deltas], dtype=bool)
+            sample["action_valid"] = inside(self.delta_indices[self.modality_keys["action"][0]])
+            sample["frame_valid"] = np.concatenate([inside(self.delta_indices[k]) for k in self.modality_keys["video"]])
 
         return sample
 
@@ -1491,12 +1709,33 @@ class LeRobotSingleDataset(Dataset):
             import pyarrow.compute as pc
             import pyarrow.parquet as pq
 
-            # single-threaded: pyarrow's default thread pool (one per CPU) in every
-            # dataloader worker oversubscribes the host (64 workers x 64 threads)
-            table = pq.read_table(parquet_path, use_threads=False)
-            ep_col = table.column("episode_index").to_numpy()
-            if not bool((ep_col == trajectory_id).all()):  # merged (multi-episode) file
-                table = table.filter(pc.equal(table["episode_index"], trajectory_id))
+            # data_cfg.cache_parquet_tables: keep every data file this worker has read in memory and
+            # slice the episode out, instead of re-reading + filtering the whole multi-episode v3
+            # file on every sample. With random sampling the curr_traj_id shortcut almost never hits,
+            # and on car-turn-signal the re-read was ~470 ms CPU of a ~910 ms sample.
+            use_cache = bool(self.data_cfg.get("cache_parquet_tables", False)) if self.data_cfg else False
+            cache = self.__dict__.setdefault("_parquet_table_cache", {}) if use_cache else None
+            if use_cache and parquet_path in cache:
+                full, spans = cache[parquet_path]
+            else:
+                # single-threaded: pyarrow's default thread pool (one per CPU) in every
+                # dataloader worker oversubscribes the host (64 workers x 64 threads)
+                full = pq.read_table(parquet_path, use_threads=False)
+                spans = None
+                if use_cache:
+                    ep = full.column("episode_index").to_numpy()
+                    starts = np.flatnonzero(np.r_[True, ep[1:] != ep[:-1]])
+                    ends = np.r_[starts[1:], len(ep)]
+                    if len(np.unique(ep[starts])) == len(starts):  # each episode is one contiguous run
+                        spans = {int(ep[s]): (int(s), int(e - s)) for s, e in zip(starts, ends)}
+                    cache[parquet_path] = (full, spans)
+            if spans is not None and int(trajectory_id) in spans:
+                table = full.slice(*spans[int(trajectory_id)])
+            else:
+                table = full
+                ep_col = table.column("episode_index").to_numpy()
+                if not bool((ep_col == trajectory_id).all()):  # merged (multi-episode) file
+                    table = table.filter(pc.equal(table["episode_index"], trajectory_id))
             cols, stacked = {}, {}
             for name in table.column_names:
                 col = table.column(name).combine_chunks()
@@ -1736,8 +1975,9 @@ class LeRobotSingleDataset(Dataset):
         # Get the maximum length of the trajectory
         max_length = self.trajectory_lengths[trajectory_index]
         assert key.startswith(modality + "."), f"{key} must start with {modality + '.'}, got {key}"
-        # Get the sub-key, e.g. state.joint_angles -> joint_angles
-        key = key.replace(modality + ".", "")
+        # Get the sub-key, e.g. state.joint_angles -> joint_angles. Strip only the
+        # leading prefix — group names may themselves contain "action."/"state.".
+        key = key.replace(modality + ".", "", 1)
         # Get the lerobot key
         le_state_or_action_cfg = getattr(self.lerobot_modality_meta, modality)
         le_key = le_state_or_action_cfg[key].original_key
@@ -2173,13 +2413,13 @@ def get_used_modality_keys(modality_keys: dict) -> tuple[list, list]:
     # Extract action keys (remove "action." prefix)
     for action_key in modality_keys.get("action", []):
         if action_key.startswith("action."):
-            clean_key = action_key.replace("action.", "")
+            clean_key = action_key.replace("action.", "", 1)
             used_action_keys.append(clean_key)
     
     # Extract state keys (remove "state." prefix)  
     for state_key in modality_keys.get("state", []):
         if state_key.startswith("state."):
-            clean_key = state_key.replace("state.", "")
+            clean_key = state_key.replace("state.", "", 1)
             used_state_keys.append(clean_key)
     
     return used_action_keys, used_state_keys
@@ -2231,6 +2471,22 @@ class LeRobotMixtureDataset(Dataset):
         self.seed = seed
         self.mode = mode
         self.data_cfg = kwargs["data_cfg"] if "data_cfg" in kwargs else None
+        # Streaming (datasets.<split>.stream: {stride: 15, random_start: true}): episodes are walked from their start in
+        # steps of `stride` frames, one stream per (rank, batch position), for a recurrent model state carried across
+        # training steps (QwenGR00T_DualSystem dual_system.memory.stream). See _stream_item.
+        st = self.data_cfg.get("stream", None) if self.data_cfg is not None else None
+        self._stream = None
+        if st:
+            self._stream = {
+                "stride": int(st.get("stride", 15)),
+                "random_start": bool(st.get("random_start", True)),
+                # random_phase: every episode starts at a random frame in [0, stride) instead of frame 0, so the walked
+                # grid covers all frames over the passes (False = the grid 0, stride, 2 stride, ... of every episode)
+                "random_phase": bool(st.get("random_phase", False)),
+                "batch": int(self.data_cfg.get("per_device_batch_size", 1)),
+                "world": int(os.environ.get("WORLD_SIZE", "1")),
+            }
+            self._stream_cache = {}
 
         # Set properties for sampling
 
@@ -2366,6 +2622,68 @@ class LeRobotMixtureDataset(Dataset):
 
     
 
+    def _stream_episode(self, slot: int, j: int) -> tuple:
+        """The j-th episode of stream `slot` -> (dataset index, trajectory index, grid steps, first step, phase)."""
+        stride = self._stream["stride"]
+        rng = np.random.default_rng(safe_hash(("stream", self.seed, slot, j)))
+        di = int(rng.choice(len(self.datasets), p=self.dataset_sampling_weights))
+        ti = int(rng.choice(len(self.datasets[di].trajectory_ids), p=self.trajectory_sampling_weights[di]))
+        length = int(self.datasets[di].trajectory_lengths[ti])
+        n = (length - 1) // stride + 1
+        first = int(rng.integers(n)) if (j == 0 and self._stream["random_start"]) else 0
+        phase = 0
+        if self._stream.get("random_phase", False):  # drawn after `first`: the default rng stream is unchanged
+            phase = int(rng.integers(min(stride, length)))
+            n = (length - 1 - phase) // stride + 1
+            first = min(first, n - 1)
+        return di, ti, n, first, phase
+
+    def _stream_locate(self, slot: int, k: int) -> tuple:
+        """Step k of stream `slot` -> (episode counter j, dataset index, trajectory index, grid steps, step in episode,
+        phase = frame of grid step 0)."""
+        eps = self._stream_cache.setdefault(slot, [])  # [(first stream step, di, ti, n, first episode step, phase)]
+        while not eps or eps[-1][0] + eps[-1][3] - eps[-1][4] <= k:
+            start = eps[-1][0] + eps[-1][3] - eps[-1][4] if eps else 0
+            eps.append((start, *self._stream_episode(slot, len(eps))))
+        j = int(np.searchsorted([e[0] for e in eps], k, side="right")) - 1
+        start, di, ti, n, first, phase = eps[j]
+        return j, di, ti, n, first + k - start, phase
+
+    def _stream_item(self, index: int) -> dict:
+        """Streaming sample. The loader's sequential batches of B (= per_device_batch_size) are dealt round-robin to the
+        W ranks (accelerate, dispatch_batches=False), so index i -> stream slot i % (W * B) (= rank * B + batch position)
+        and stream step i // (W * B): consecutive training steps of a batch position walk one episode in steps of
+        `stride` frames, from its frame 0 (the first episode of each stream from a random step, random_start), then the
+        next random episode. One photometric augmentation draw per (stream, episode). sample["stream"] = [slot, step,
+        episode counter, step in the episode, grid steps of the episode]."""
+        sw = self._stream
+        slot, k = index % (sw["world"] * sw["batch"]), index // (sw["world"] * sw["batch"])
+        j, di, ti, n, es, phase = self._stream_locate(slot, k)
+        dataset = self.datasets[di]
+        trajectory_id = dataset.trajectory_ids[ti]
+        base = phase + es * sw["stride"]
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(safe_hash(("stream_aug", self.seed, slot, j)) % (2 ** 63))
+            raw_data = dataset.get_step_data(trajectory_id, base)
+            data = dataset.transforms(raw_data)
+            sample = dataset._pack_sample(data, trajectory_id=trajectory_id, base_index=base)
+        sample["stream"] = np.array([slot, k, j, es, n], dtype=np.int64)
+        return sample
+
+    def stream_episode_samples(self, dataset_index: int, trajectory_index: int, stride: int) -> list:
+        """Every `stride`-th frame of one episode from its frame 0 (streaming eval), sample["stream"] as in _stream_item
+        with slot = trajectory_index."""
+        dataset = self.datasets[dataset_index]
+        trajectory_id = dataset.trajectory_ids[trajectory_index]
+        n = (int(dataset.trajectory_lengths[trajectory_index]) - 1) // stride + 1
+        out = []
+        for es in range(n):
+            data = dataset.transforms(dataset.get_step_data(trajectory_id, es * stride))
+            sample = dataset._pack_sample(data, trajectory_id=trajectory_id, base_index=es * stride)
+            sample["stream"] = np.array([trajectory_index, es, 0, es, n], dtype=np.int64)
+            out.append(sample)
+        return out
+
     def __getitem__(self, index: int) -> dict:
         """Get the data for a single trajectory and start index.
 
@@ -2375,6 +2693,8 @@ class LeRobotMixtureDataset(Dataset):
         Returns:
             dict: The data for the trajectory and start index.
         """
+        if getattr(self, "_stream", None) is not None:
+            return self._stream_item(index)
         self._getitem_count += 1
         if self._getitem_count % 1000 == 0:
             gc.collect()
@@ -2409,7 +2729,7 @@ class LeRobotMixtureDataset(Dataset):
                     
                 raw_data = dataset.get_step_data(trajectory_id, step)    
                 data = dataset.transforms(raw_data)
-                sample = dataset._pack_sample(data)
+                sample = dataset._pack_sample(data, trajectory_id=trajectory_id, base_index=step)
                 
                 return sample
                 
@@ -2435,6 +2755,8 @@ class LeRobotMixtureDataset(Dataset):
         Returns:
             int: The length of a single epoch in the mixture.
         """
+        if getattr(self, "_stream", None) is not None:
+            return 10 ** 9  # streaming: indices are (slot, step) codes, the streams never wrap
         # Check for potential issues
         if len(self.datasets) == 0:
             return 0

@@ -52,7 +52,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             from starVLA.dataloader.qwenvl_collate import QwenVLPreprocessCollate
             _proc = AutoProcessor.from_pretrained(cfg.framework.qwenvl.base_vlm)
             _proc.tokenizer.padding_side = "left"
-            collate_fn = QwenVLPreprocessCollate(_proc, cot_prompt=vla_dataset_cfg.get("CoT_prompt", None))
+            collate_fn = QwenVLPreprocessCollate(_proc, cot_prompt=vla_dataset_cfg.get("CoT_prompt", None), frame_tags=vla_dataset_cfg.get("frame_tags", None))
         dataloader_kwargs = {
             "batch_size": cfg.datasets.vla_data.per_device_batch_size,
             "collate_fn": collate_fn,
@@ -63,11 +63,14 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         if num_workers > 0:
             dataloader_kwargs["persistent_workers"] = bool(vla_dataset_cfg.get("persistent_workers", True))
             dataloader_kwargs["prefetch_factor"] = int(vla_dataset_cfg.get("prefetch_factor", 2))
+            dataloader_kwargs["in_order"] = bool(vla_dataset_cfg.get("in_order", True))
             # "spawn" is required for CUDA use inside workers (e.g. video_backend: torchcodec_cuda)
             mp_context = vla_dataset_cfg.get("multiprocessing_context", None)
             if mp_context:
                 dataloader_kwargs["multiprocessing_context"] = str(mp_context)
 
+        if vla_dataset_cfg.get("stream", None) and not dataloader_kwargs.get("in_order", True):
+            raise ValueError("datasets.vla_data.stream needs in_order: true (each batch position walks one episode)")
         vla_train_dataloader = DataLoader(
             vla_dataset,
             **dataloader_kwargs,

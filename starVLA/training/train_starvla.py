@@ -13,6 +13,7 @@ Conventions:
 # Standard Library
 import argparse
 import json
+import contextlib
 import os
 import time
 from pathlib import Path
@@ -34,7 +35,7 @@ except ImportError:
 import wandb
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedType, set_seed
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -47,8 +48,36 @@ from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
+def _preset_grad_accum_env():
+    """Accelerator and DeepSpeedPlugin read the accumulation factor from
+    ACCELERATE_GRADIENT_ACCUMULATION_STEPS when they are constructed (module
+    import, before the yaml is parsed), so mirror cfg.trainer.gradient_accumulation_steps
+    into that env var here. Without this the yaml value was silently ignored
+    (global batch = per_device x world only)."""
+    import sys
+
+    if os.environ.get("ACCELERATE_GRADIENT_ACCUMULATION_STEPS"):
+        return
+    try:
+        if "--config_yaml" in sys.argv:
+            _cfg = OmegaConf.load(sys.argv[sys.argv.index("--config_yaml") + 1])
+            gas = int(_cfg.trainer.get("gradient_accumulation_steps", 1) or 1)
+            if gas > 1:
+                os.environ["ACCELERATE_GRADIENT_ACCUMULATION_STEPS"] = str(gas)
+    except Exception as e:  # never block training on this convenience
+        print(f"[train_starvla] could not preset ACCELERATE_GRADIENT_ACCUMULATION_STEPS: {e}")
+
+
+_preset_grad_accum_env()
 deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+# Long process-group timeout: rank 0 may spend >30 min computing dataset
+# statistics while the other ranks wait at a barrier (default 30 min killed them).
+from datetime import timedelta
+from accelerate.utils import InitProcessGroupKwargs
+accelerator = Accelerator(
+    deepspeed_plugin=deepspeed_plugin,
+    kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=int(os.environ.get("STARVLA_PG_TIMEOUT_HOURS", "3"))))],
+)
 accelerator.print(accelerator.state)
 
 # Sane Defaults
@@ -104,13 +133,21 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
         muon_lr = float(cfg.trainer.optimizer.get("muon_lr", 0.02))
         muon_wd = float(cfg.trainer.optimizer.get("muon_weight_decay", 0.0))
+        # Restrict Muon to these lr groups (by group name); every other group is
+        # pure AdamW at its group lr. Unset/empty -> Muon on all groups (legacy).
+        muon_modules = cfg.trainer.optimizer.get("muon_modules", None)
+        muon_modules = set(muon_modules) if muon_modules else None
         embedding_param_ids = {
             id(p) for m in model.modules() if isinstance(m, torch.nn.Embedding) for p in m.parameters()
         }
         split_groups = []
         for group in param_groups:
-            muon_params = [p for p in group["params"] if p.ndim == 2 and id(p) not in embedding_param_ids]
-            adam_params = [p for p in group["params"] if p.ndim != 2 or id(p) in embedding_param_ids]
+            group_uses_muon = muon_modules is None or group.get("name", "base") in muon_modules
+            if group_uses_muon:
+                muon_params = [p for p in group["params"] if p.ndim == 2 and id(p) not in embedding_param_ids]
+                adam_params = [p for p in group["params"] if p.ndim != 2 or id(p) in embedding_param_ids]
+            else:
+                muon_params, adam_params = [], list(group["params"])
             if muon_params:
                 split_groups.append(
                     {"params": muon_params, "lr": muon_lr, "weight_decay": muon_wd,
@@ -430,12 +467,23 @@ class VLATrainer(TrainerUtils):
             t_end_data = time.perf_counter()
 
             t_start_model = time.perf_counter()
+            # step-dependent loss schedules (e.g. QwenLatentWorldAction's action-loss warmup); resume-safe
+            _core = self.accelerator.unwrap_model(self.model)
+            if hasattr(_core, "set_training_step"):
+                _core.set_training_step(self.completed_steps)
             step_metrics = self._train_step(batch_vla)
             t_end_model = time.perf_counter()
 
             if self.accelerator.sync_gradients:
                 progress_bar.update(1)
                 self.completed_steps += 1
+                # Adaptive action heads (e.g. ActionSplatHead densify/prune)
+                # rewrite their point population between optimizer steps.
+                _am = getattr(self.accelerator.unwrap_model(self.model), "action_model", None)
+                if hasattr(_am, "adaptive_step"):
+                    _adaptive_stats = _am.adaptive_step(self.completed_steps, self.optimizer)
+                    if _adaptive_stats and self.completed_steps % self.config.trainer.logging_frequency == 0:
+                        step_metrics.update(_adaptive_stats)
 
             if self.accelerator.is_local_main_process:
                 progress_bar.set_postfix(
@@ -452,6 +500,29 @@ class VLATrainer(TrainerUtils):
             # timing/preprocess (input building on CPU) is reported by the
             # framework's forward when available; model time excludes it.
             step_metrics["timing/model"] = (t_end_model - t_start_model) - step_metrics.get("timing/preprocess", 0.0)
+
+            if os.environ.get("STARVLA_TIMING_DEBUG") == "1" and dist.is_initialized():
+                local_timing = torch.tensor(
+                    [
+                        step_metrics["timing/data_load"],
+                        step_metrics["timing/model"],
+                        step_metrics["timing/backward"],
+                    ],
+                    device=self.accelerator.device,
+                    dtype=torch.float64,
+                )
+                rank_timings = [torch.empty_like(local_timing) for _ in range(dist.get_world_size())]
+                dist.all_gather(rank_timings, local_timing)
+                if self.accelerator.is_main_process:
+                    timing_rows = [tensor.cpu().tolist() for tensor in rank_timings]
+                    log_interval = max(1, int(os.environ.get("STARVLA_TIMING_LOG_INTERVAL", "100")))
+                    if self.completed_steps % log_interval == 0 or any(row[0] >= 2.0 for row in timing_rows):
+                        timing_text = " ".join(
+                            f"r{rank}:data={values[0]:.3f},model={values[1]:.3f},backward={values[2]:.3f}"
+                            for rank, values in enumerate(timing_rows)
+                        )
+                        logger.info(f"RANK_TIMING step={self.completed_steps} {timing_text}")
+
             self._log_metrics(step_metrics)
 
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
@@ -463,7 +534,23 @@ class VLATrainer(TrainerUtils):
         self._finalize_training()
 
     def eval_action_model(self, step_metrics: dict = None) -> float:
-        """Run simple action-eval on current batch and attach score to metrics."""
+        """Run simple action-eval on current batch and attach score to metrics.
+
+        Frameworks without an action head set `use_action_head = False`; frameworks may also define
+        `trainer_eval_hook(get_batch, step, output_dir, is_main) -> dict`, e.g. the world-model metrics /
+        sample images of QwenGR00T_TriSystem. Every rank enters the hook (building a validation dataset runs
+        collectives such as the steps-index barrier); only the main process evaluates.
+        """
+        core = self.accelerator.unwrap_model(self.model)
+        hook = getattr(core, "trainer_eval_hook", None)
+        if hook is not None:
+            hook_metrics = hook(self._get_next_batch, self.completed_steps, self.config.output_dir,
+                                is_main=self.accelerator.is_main_process)
+            if self.accelerator.is_main_process:
+                step_metrics.update(hook_metrics)
+            self.accelerator.wait_for_everyone()
+        if not getattr(core, "use_action_head", True):
+            return step_metrics
         examples = self._get_next_batch()
         if isinstance(examples, dict) and "examples" in examples:  # prebuilt collate
             examples = getattr(examples["examples"], "items", examples["examples"])
@@ -475,6 +562,8 @@ class VLATrainer(TrainerUtils):
         if self.accelerator.is_main_process:
             normalized_actions = output_dict["normalized_actions"]
             actions = np.array(actions)
+            if actions.shape[1] > normalized_actions.shape[1]:  # past+future dataset windows: score the future part
+                actions = actions[:, -normalized_actions.shape[1]:]
             num_pots = np.prod(actions.shape)
             score = TrainerUtils.euclidean_distance(normalized_actions, actions)
             step_metrics["mse_score"] = score / num_pots
@@ -493,15 +582,31 @@ class VLATrainer(TrainerUtils):
             logger.info(f"  Gradient accumulation steps = {self.accelerator.gradient_accumulation_steps}")
             logger.info(f"  Total batch size = {self.total_batch_size}")
 
+    def _accumulation_context(self):
+        """Gradient-accumulation context for one micro-step.
+
+        DeepSpeed accumulates inside the engine (loss / gas, optimizer step only
+        at the boundary), but accelerate's accumulate() wraps non-boundary
+        micro-steps in engine.no_sync(), and DeepSpeed refuses engine.step()
+        inside that context ("It is illegal to call Engine.step() inside no_sync")
+        on multi-GPU runs. Keep accelerate's step / sync_gradients bookkeeping
+        (_do_sync) and skip the no_sync wrapper for DeepSpeed.
+        """
+        if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+            self.accelerator._do_sync()
+            return contextlib.nullcontext()
+        return self.accelerator.accumulate(self.model)
+
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
-        with self.accelerator.accumulate(self.model):
+        with self._accumulation_context():
             self.optimizer.zero_grad()
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
-                action_loss = output_dict["action_loss"]
-                total_loss = action_loss
+                # Multi-loss frameworks return the weighted total as "loss"; action-only ones just "action_loss".
+                action_loss = output_dict.get("action_loss")
+                total_loss = output_dict["loss"] if "loss" in output_dict else action_loss
 
             # Grad-norm probe: under DeepSpeed, accelerator.backward() runs
             # engine.backward AND engine.step (which zeroes grads), so grads
@@ -534,16 +639,18 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
-        metrics = {
-            "action_dit_loss": action_loss.item(),
-        }
+        metrics = {}
+        if action_loss is not None:
+            metrics["action_dit_loss"] = action_loss.item()
+        if "loss" in output_dict:
+            metrics["total_loss"] = total_loss.item()
         if grad_norm is not None:
             metrics["grad_norm"] = grad_norm
         metrics["timing/backward"] = _bwd_time
         metrics["timing/optimizer"] = _opt_time
         # pass through extra scalar stats from the framework (e.g. wta/*)
         for k, v in output_dict.items():
-            if k != "action_loss" and isinstance(v, (int, float)):
+            if k not in ("action_loss", "loss") and isinstance(v, (int, float)):
                 metrics[k] = v
         return metrics
 

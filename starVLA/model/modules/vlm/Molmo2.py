@@ -26,18 +26,53 @@ with coordinates normalized to [0, 1000]. This is useful as an auxiliary groundi
 signal when training action heads on top of the last hidden state.
 """
 
+import contextlib
 from typing import Optional
 
 import torch
 import torch.nn as nn
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from transformers.processing_utils import ProcessorMixin
 
 from starVLA.training.trainer_utils import initialize_overwatch
 
 logger = initialize_overwatch(__name__)
 
 IGNORE_INDEX = -100
+
+
+# --- transformers>=5 compat for the Molmo2 remote code (written against 4.57) ---
+def _default_rope_init(config, device=None, **_):
+    # transformers 5 dropped ROPE_INIT_FUNCTIONS["default"]; Molmo2RotaryEmbedding still looks it up.
+    base = getattr(config, "rope_theta", None) or config.rope_parameters["rope_theta"]
+    dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+    return inv_freq, 1.0
+
+
+ROPE_INIT_FUNCTIONS.setdefault("default", _default_rope_init)
+
+
+@contextlib.contextmanager
+def _lenient_processor_init():
+    """transformers 5 ProcessorMixin rejects non-attribute kwargs, which Molmo2Processor passes
+    (image_use_col_tokens, ...). Set them as plain attributes after init, as MolmoAct2's processor does."""
+    orig = ProcessorMixin.__init__
+
+    def _init(self, *args, **kwargs):
+        keep = set(self.get_attributes()) | {"chat_template", "audio_tokenizer"}
+        extra = {k: kwargs.pop(k) for k in list(kwargs) if k not in keep}
+        orig(self, *args, **kwargs)
+        for k, v in extra.items():
+            setattr(self, k, v)
+
+    ProcessorMixin.__init__ = _init
+    try:
+        yield
+    finally:
+        ProcessorMixin.__init__ = orig
 
 
 class _Molmo2_VL_Interface(nn.Module):
@@ -72,9 +107,20 @@ class _Molmo2_VL_Interface(nn.Module):
             model_id,
             trust_remote_code=True,
             attn_implementation=attn_implementation,
-            dtype=torch.bfloat16,
+            # same knob as QWen3_5.py: float32 when the VLM is trained without an fp32 master copy (ZeRO-0 / Muon)
+            dtype=getattr(torch, str(qwenvl_config.get("torch_dtype", "bfloat16"))),
         )
-        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        # transformers 5 builds the model on the meta device and only materializes checkpoint tensors;
+        # Molmo2RotaryEmbedding.inv_freq is a non-persistent buffer, so it comes out as uninitialized
+        # memory (-> NaN hidden states). Recompute it. (MolmoAct2 instead stores inv_freq in the ckpt.)
+        for m in model.modules():
+            if hasattr(m, "inv_freq") and hasattr(m, "rope_init_fn"):
+                inv_freq, m.attention_scaling = m.rope_init_fn(m.config, m.inv_freq.device)
+                m.inv_freq = inv_freq
+                m.original_inv_freq = inv_freq.clone()
+
+        with _lenient_processor_init():
+            processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
         if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
             processor.tokenizer.padding_side = "left"
 
@@ -101,7 +147,12 @@ class _Molmo2_VL_Interface(nn.Module):
                 f"[Molmo2] could not locate text_config.hidden_size on `{model_id}`. "
                 f"Check that the checkpoint exposes a Qwen3/OLMo-style text_config."
             )
-        self.model.config.hidden_size = text_cfg.hidden_size
+        # Molmo2Config already exposes `hidden_size` as a read-only property on recent revisions.
+        if getattr(self.model.config, "hidden_size", None) != text_cfg.hidden_size:
+            self.model.config.hidden_size = text_cfg.hidden_size
+        # transformers 5 no longer gives every config a `use_cache` default; Molmo2Model.forward reads it.
+        if not hasattr(self.model.config, "use_cache"):
+            self.model.config.use_cache = False
 
     def forward(self, **kwargs) -> CausalLMOutputWithPast:
         """

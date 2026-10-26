@@ -4,7 +4,7 @@
 Qwen-GR00T-Regressor Framework
 Qwen-VL + GR00T-style DiT regression head (no flow matching):
 no noised-action input, no timestep embedding, single-pass action regression
-with optional winner-takes-all multiple hypotheses (see GR00T_RegressorHeader).
+(see GR00T_RegressorHeader).
 """
 
 import sys
@@ -36,9 +36,8 @@ logger = initialize_overwatch(__name__)
 class QwenGR00TRegressorDefaultConfig:
     """QwenGR00T_Regressor framework default parameters.
 
+    (noise schedule, timestep buckets, inference steps, repeat factor).
     Same VLM/DiT shape as QwenGR00T, minus every flow-matching knob
-    (noise schedule, timestep buckets, inference steps, repeat factor),
-    plus the WTA multiple-hypothesis fields of the regression head.
     """
 
     name: str = "QwenGR00T_Regressor"
@@ -59,11 +58,9 @@ class QwenGR00TRegressorDefaultConfig:
             "state_dim": 7,
             "action_horizon": 8,
             "num_target_vision_tokens": 32,
-            # Regression / WTA knobs (see RegressionActionHead)
+            # Regression knobs (see RegressionActionHead)
             "loss_type": "l1",
-            "num_hypotheses": 8,
-            "wta_relax": 0.05,
-            "score_loss_coeff": 1.0,
+            # per-window expert stack depth (multi_window_mode == "experts")
             "moe_expert_layers": 1,
             "diffusion_model_cfg": {
                 "cross_attention_dim": 2048,  # aligned to VLM hidden_size at runtime
@@ -73,6 +70,9 @@ class QwenGR00TRegressorDefaultConfig:
                 "num_layers": 16,
                 "output_dim": 1024,
                 "positional_embeddings": None,
+                # learnable LayerNorm scale/shift (GR00T's DiT default is False because
+                # AdaLN supplied them; the regressor has no AdaLN)
+                "norm_elementwise_affine": True,
             },
         }
     )
@@ -151,6 +151,10 @@ class Qwen_GR00T_Regressor(Qwen_GR00T):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             actions = torch.tensor(np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype)
             actions_target = actions[:, -self.action_horizon :, :]  # (B, action_horizon, action_dim)
+            assert actions_target.shape[1] == self.action_horizon, (
+                f"dataset returned {actions.shape[1]} action steps < action_horizon {self.action_horizon}; "
+                "check the data registry action_indices"
+            )
 
             state_t = None
             if state is not None:
@@ -176,7 +180,8 @@ class Qwen_GR00T_Regressor(Qwen_GR00T):
                 )
             if was_training:
                 self.action_model.train()
-            diff = pred_eval.float() - actions_target.float()
+            tgt_eval = self.action_model.expand_targets(actions_target) if hasattr(self.action_model, "expand_targets") else actions_target
+            diff = pred_eval.float() - tgt_eval.float()
             mse_score = (torch.linalg.norm(diff) / pred_eval.numel()).item()  # legacy: L2/N, scales with 1/sqrt(batch)
             action_rmse = diff.pow(2).mean().sqrt().item()  # batch-size invariant
 

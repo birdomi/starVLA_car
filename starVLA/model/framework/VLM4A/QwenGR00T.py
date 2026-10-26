@@ -19,6 +19,8 @@ if str(_workspace_root) not in sys.path:
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import time
+
 import numpy as np
 import torch
 from PIL import Image
@@ -164,22 +166,55 @@ class Qwen_GR00T(baseframework):
         # only ever read `action_horizon` here.
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
 
+    def _progress_of(self, examples) -> Optional[np.ndarray]:
+        """Episode progress t / T_episode per example ([B] float32), or None when the DiT is not
+        progress-conditioned. Training samples carry it with datasets.vla_data.emit_progress;
+        at inference the caller sets example["progress"]."""
+        if getattr(getattr(self.action_model, "model", None), "progress_encoder", None) is None:
+            return None
+        if "progress" not in examples[0]:
+            raise KeyError("progress-conditioned DiT: every example needs 'progress' (t / T_episode); "
+                           "set datasets.vla_data.emit_progress: true for training")
+        return np.asarray([example["progress"] for example in examples], dtype=np.float32)
+
     def forward(
         self,
         examples: List[dict] = None,
         **kwargs,
     ) -> Tuple:
-        """ """
+        """Training forward.
+
+        `examples` is a list of example dicts, or — with
+        datasets.vla_data.preprocess_in_workers — a dict
+        {"qwen_inputs": <processor output>, "examples": ExampleList} built by
+        QwenVLPreprocessCollate (the dataset already resized the frames).
+        Returns the flow-matching loss plus per-step timing and a free eval
+        metric (4-step sampling with the head in eval mode on the same VLM
+        features), logged by the trainer like the regressor framework.
+        """
+        prebuilt = None
+        if isinstance(examples, dict) and "qwen_inputs" in examples:
+            prebuilt, examples = examples["qwen_inputs"], examples["examples"]
+            examples = getattr(examples, "items", examples)  # ExampleList holder -> list
+
         batch_images = [example["image"] for example in examples]  #  [B, [PLT]]
         instructions = [example["lang"] for example in examples]  # [B, str]
-        actions = [example["action"] for example in examples]  # label [B, len, 7]
-
+        actions = [example["action"] for example in examples]  # label [B, len, action_dim]
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
+        progress = self._progress_of(examples)  # [B] t / T_episode, only for a progress-conditioned DiT
 
         # Step 1: QWenVL input format
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        t_pre = time.perf_counter()
+        if prebuilt is not None:
+            device = self.qwen_vl_interface.model.device
+            qwen_inputs = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in prebuilt.items()}
+        else:
+            qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        preprocess_time = time.perf_counter() - t_pre
         backbone_attention_mask = qwen_inputs.get("attention_mask", None)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+
+        t_vlm = time.perf_counter()
+        with torch.autocast("cuda", dtype=getattr(self.qwen_vl_interface, "autocast_dtype", torch.bfloat16)):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
                 output_attentions=False,
@@ -188,8 +223,11 @@ class Qwen_GR00T(baseframework):
             )
             # last_hidden_state: [B, seq_len, H]
             last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
+        torch.cuda.synchronize()
+        vlm_time = time.perf_counter() - t_vlm
 
         # Step 4: Action Expert Forward and Loss
+        t_head = time.perf_counter()
         with torch.autocast("cuda", dtype=torch.float32):
             actions = torch.tensor(
                 np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
@@ -203,22 +241,51 @@ class Qwen_GR00T(baseframework):
             )
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
+            mask_repeated = None
             if backbone_attention_mask is not None:
-                backbone_attention_mask = backbone_attention_mask.repeat(repeated_diffusion_steps, 1).to(
-                    dtype=torch.bool
-                )
+                mask_repeated = backbone_attention_mask.repeat(repeated_diffusion_steps, 1).to(dtype=torch.bool)
 
-            state_repeated = None
+            state_t = state_repeated = None
             if state is not None:
-                state = torch.tensor(np.array(state), device=last_hidden.device, dtype=last_hidden.dtype)
-                state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
+                state_t = torch.tensor(np.array(state), device=last_hidden.device, dtype=last_hidden.dtype)
+                state_repeated = state_t.repeat(repeated_diffusion_steps, 1, 1)
+
+            progress_t = progress_repeated = None
+            if progress is not None:
+                progress_t = torch.as_tensor(progress, device=last_hidden.device)
+                progress_repeated = progress_t.repeat(repeated_diffusion_steps)
 
             action_loss = self.action_model(
                 last_hidden_repeated, actions_target_repeated, state_repeated,
-                encoder_attention_mask=backbone_attention_mask,
+                encoder_attention_mask=mask_repeated, progress=progress_repeated,
             )  # (B, chunk_len, action_dim)
+        torch.cuda.synchronize()
+        head_time = time.perf_counter() - t_head
 
-        return {"action_loss": action_loss}
+        # Free per-step eval metric on the SAME VLM features: sample the head
+        # in eval mode and score like TrainerUtils.eval_action_model (L2 / N).
+        with torch.no_grad():
+            was_training = self.action_model.training
+            self.action_model.eval()
+            with torch.autocast("cuda", dtype=torch.float32):
+                mask = backbone_attention_mask.to(dtype=torch.bool) if backbone_attention_mask is not None else None
+                pred_eval = self.action_model.predict_action(
+                    last_hidden.detach(), state_t, encoder_attention_mask=mask, progress=progress_t
+                )
+            if was_training:
+                self.action_model.train()
+            diff = pred_eval.float() - actions_target.float()
+            mse_score = (torch.linalg.norm(diff) / pred_eval.numel()).item()  # legacy: L2/N, scales with 1/sqrt(batch)
+            action_rmse = diff.pow(2).mean().sqrt().item()  # batch-size invariant
+
+        return {
+            "action_loss": action_loss,
+            "timing/preprocess": preprocess_time,
+            "timing/vlm_fwd": vlm_time,
+            "timing/head_fwd": head_time,
+            "mse_score": mse_score,
+            "action_rmse": action_rmse,
+        }
 
     @torch.inference_mode()
     def predict_action(
@@ -241,6 +308,7 @@ class Qwen_GR00T(baseframework):
         instructions = [example["lang"] for example in examples]  # [B, str]
 
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
+        progress = self._progress_of(examples)  # [B] t / T_episode, only for a progress-conditioned DiT
 
         train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
         if train_obs_image_size:
@@ -251,7 +319,7 @@ class Qwen_GR00T(baseframework):
         backbone_attention_mask = qwen_inputs.get("attention_mask", None)
         if backbone_attention_mask is not None:
             backbone_attention_mask = backbone_attention_mask.to(dtype=torch.bool)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=getattr(self.qwen_vl_interface, "autocast_dtype", torch.bfloat16)):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
                 output_attentions=False,
@@ -268,10 +336,13 @@ class Qwen_GR00T(baseframework):
             else None
         )
 
+        if progress is not None:
+            progress = torch.as_tensor(progress, device=last_hidden.device)
+
         # Step 4: Action Expert Forward
         with torch.autocast("cuda", dtype=torch.float32):
             pred_actions = self.action_model.predict_action(
-                last_hidden, state, encoder_attention_mask=backbone_attention_mask
+                last_hidden, state, encoder_attention_mask=backbone_attention_mask, progress=progress
             )  # (B, chunk_len, action_dim)
 
         normalized_actions = pred_actions.detach().cpu().numpy()

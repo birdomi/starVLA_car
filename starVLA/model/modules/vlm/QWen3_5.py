@@ -5,6 +5,7 @@
 
 from typing import Optional
 
+from starVLA.dataloader.qwenvl_collate import build_image_content
 import torch
 from starVLA.model.tools import has_flash_attn  # unified flash-attn detection (GPU / NPU)
 from starVLA.training.trainer_utils import initialize_overwatch
@@ -59,7 +60,6 @@ class _QWen3_5_VL_Interface(nn.Module):
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-VL-4B-Instruct")
         attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
 
-        attn_implementation = "sdpa"
         # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
         if attn_implementation == "flash_attention_2":
             if not has_flash_attn():
@@ -69,7 +69,10 @@ class _QWen3_5_VL_Interface(nn.Module):
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
             model_id,
             attn_implementation=attn_implementation,
-            torch_dtype=torch.bfloat16,
+            # bf16 weights are fine for a frozen VLM; when the VLM is trained
+            # with ZeRO stage 0 (no fp32 master copy, e.g. the Muon runs) use
+            # torch_dtype: float32 so small lr updates are not rounded away.
+            torch_dtype=getattr(torch, str(qwenvl_config.get("torch_dtype", "bfloat16"))),
         )
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
@@ -77,6 +80,10 @@ class _QWen3_5_VL_Interface(nn.Module):
         self.model = model
         self.processor = processor
         self.config = config
+        # Compute dtype of the VLM forward (framework.qwenvl.autocast_dtype). bfloat16 is
+        # what every run trained with; float16 is for inference/eval (Qwen3.5-2B peak
+        # |hidden| on car frames is ~84, far inside fp16 range; cos 0.9998 vs fp32).
+        self.autocast_dtype = getattr(torch, str(qwenvl_config.get("autocast_dtype", "bfloat16")))
 
         # alin qwen3.5 with qwen2.5
         self.model.config.hidden_size = self.model.config.text_config.hidden_size
@@ -94,7 +101,7 @@ class _QWen3_5_VL_Interface(nn.Module):
         Forward pass delegating to underlying Qwen3.5-VL backbone.
         """
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=self.autocast_dtype):
             outputs = self.model(
                 **kwargs,
             )
@@ -129,7 +136,8 @@ class _QWen3_5_VL_Interface(nn.Module):
         messages = []
         assert len(images) == len(instructions), "Images and instructions must have the same length"
         for imgs, instruction in zip(images, instructions):
-            content = [{"type": "image", "image": img} for img in imgs]
+            frame_tags = self.config.datasets.vla_data.get("frame_tags", None) if self.config is not None else None
+            content = build_image_content(imgs, frame_tags)
 
             if "CoT_prompt" in self.config.datasets.vla_data:  # If using a grounding prompt to task
                 CoT_prompt = self.config.datasets.vla_data.get("CoT_prompt", "")

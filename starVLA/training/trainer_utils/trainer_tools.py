@@ -124,6 +124,9 @@ def build_param_lr_groups(model, cfg):
             print(f"⚠️ freeze module path does not exist: {freeze_path}")
             continue
 
+    # params the framework itself froze (requires_grad=False) never enter the optimizer
+    frozen_params.update(id(p) for p in model.parameters() if not p.requires_grad)
+
     for module_name, lr in lr_cfg.items():
         if module_name == "base":
             continue
@@ -296,9 +299,12 @@ class TrainerUtils:
                     print(f"❌ cannot find module path: {path}")
         else:  # full load
             try:
-                model.load_state_dict(checkpoint, strict=False)
+                missing, unexpected = model.load_state_dict(checkpoint, strict=False)
                 if _dist_rank() == 0:
                     print("✅ loaded <full_model> model parameters")
+                    if missing or unexpected:  # e.g. newly added modules keep their init
+                        print(f"   missing {len(missing)} keys (top-level: {sorted({k.split('.')[0] for k in missing})}), "
+                              f"unexpected {len(unexpected)} keys {unexpected[:3]}")
                 loaded_modules = ["<full_model>"]
             except Exception as e:
                 raise RuntimeError(f"❌ loading full model failed: {e}")
