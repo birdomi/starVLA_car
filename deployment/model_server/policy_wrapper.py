@@ -187,6 +187,26 @@ class PolicyServerWrapper:
                 )
         proc = self._get_processor(effective_key)
 
+        # History-conditioned heads (QwenGR00T_PatchRegressor): the client sends the RAW executed action
+        # history `past_action_abs` (P, D), chronological, plus `current_qpos` (D,). Convert to the loader's
+        # bidirectional-delta convention (past slot i: a[i] - a[i+1], with a[P] := current qpos) and normalize
+        # with the training action stats -> example["past_action"] (P, D).
+        for ex in examples:
+            # Raw proprioceptive state (D,) in state_keys order -> normalized (1, D) like the loader's state
+            # modality. Clients that already send a training-space ``state`` (e.g. sin/cos) leave this unset.
+            if "state_raw" in ex:
+                ex["state"] = proc.apply_state(np.asarray(ex.pop("state_raw"), dtype=np.float32))[None]
+            if "past_action_abs" in ex:
+                hist = np.asarray(ex.pop("past_action_abs"), dtype=np.float32)
+                cur = np.asarray(ex.pop("current_qpos"), dtype=np.float32)[None]
+                mode = ex.pop("past_mode", "delta")
+                if mode == "rel":   # loader rel convention: every slot is a[i] - s[t]
+                    ex["past_action"] = proc.apply_actions(hist - cur)
+                elif mode == "abs":  # absolute targets: history is just the raw executed actions
+                    ex["past_action"] = proc.apply_actions(hist)
+                else:               # loader delta convention: past slot i = a[i] - a[i+1], a[P] := current qpos
+                    nxt = np.concatenate([hist[1:], cur], axis=0)
+                    ex["past_action"] = proc.apply_actions(hist - nxt)
         out = self._framework.predict_action(examples=examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
 
@@ -194,4 +214,7 @@ class PolicyServerWrapper:
             [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
         )
-        return {"actions": unnorm}
+        res = {"actions": unnorm}
+        if out.get("plan_kf") is not None:  # QwenGR00T_DualSystem fast System 1: the client keeps System 2's plan
+            res["plan_kf"] = np.asarray(out["plan_kf"])
+        return res

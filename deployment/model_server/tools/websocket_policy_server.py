@@ -46,6 +46,9 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            # No keepalive pings: sim clients (RoboTwin expert checks, CPU-saturated hosts) can miss the
+            # default 20 s pong window, after which the server closes the socket and the client hangs.
+            ping_interval=None,
         ) as server:
             if self._idle_timeout > 0:
                 await self._idle_watchdog(server)

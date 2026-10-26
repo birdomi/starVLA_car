@@ -129,7 +129,8 @@ class WebsocketClientPolicy:
         self._check_eval_observation_contract(query_info)
         data = self._packer.pack(query_info)
         self._ws.send(data)
-        response = self._ws.recv()
+        # fail loudly instead of hanging forever if the server never answers
+        response = self._ws.recv(timeout=float(os.environ.get("STARVLA_CLIENT_RECV_TIMEOUT", "900")))
         if isinstance(response, str):
             raise RuntimeError(f"Error in inference server:\n{response}")
         return msgpack_numpy.unpackb(response)

@@ -357,6 +357,63 @@ class PolicyNormProcessor:
     # ------------------------------------------------------------------
     # Inverse path (model output → env action)
     # ------------------------------------------------------------------
+    def apply_actions(self, raw_actions: np.ndarray) -> np.ndarray:
+        """Normalize raw actions (T, D) with the training-time pipeline (inverse of unapply_actions).
+        Used to build the normalized executed-action history for history-conditioned heads."""
+        raw_actions = np.asarray(raw_actions, dtype=np.float32)
+        assert raw_actions.ndim == 2, f"Expected (T, D); got shape {raw_actions.shape}"
+        data: Dict[str, torch.Tensor] = {}
+        cursor = 0
+        for full_key in self._action_keys:
+            dim_k = self._action_key_dims.get(full_key, 1)
+            data[full_key] = np.ascontiguousarray(raw_actions[..., cursor : cursor + dim_k], dtype=np.float32)  # numpy: the pipeline starts with ToTensor
+            cursor += dim_k
+        # apply only the transforms whose keys are all present (the composed pipeline also carries the
+        # state transforms, which need state keys we do not have here)
+        out = data
+        for t in getattr(self._transform, "transforms", [self._transform]):
+            keys = list(getattr(t, "apply_to", []) or [])
+            if keys and all(k in out for k in keys):
+                out = t.apply(out)
+        parts: List[np.ndarray] = []
+        for full_key in self._action_keys:
+            v = out[full_key]
+            parts.append(np.asarray(v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else v))
+        return np.concatenate(parts, axis=-1)
+
+    def apply_state(self, raw_state: np.ndarray) -> np.ndarray:
+        """Normalize a raw proprioceptive state with the training-time state transforms.
+
+        ``raw_state`` is ``(D,)`` or ``(T, D)`` in the concatenated ``state_keys`` order
+        (``D == sum(state_key_dims.values())``). Returns the same shape, normalized exactly like the
+        loader's state modality (e.g. min_max joints + binary grippers, or sin/cos). Clients whose
+        models were trained with ``include_state: true`` must send state through this path; feeding
+        raw joint values (or nothing) silently shifts the input distribution.
+        """
+        raw_state = np.asarray(raw_state, dtype=np.float32)
+        squeeze = raw_state.ndim == 1
+        if squeeze:
+            raw_state = raw_state[None]
+        assert raw_state.ndim == 2, f"Expected (D,) or (T, D); got shape {raw_state.shape}"
+        data: Dict[str, np.ndarray] = {}
+        cursor = 0
+        for full_key in self._state_keys:
+            dim_k = self._state_key_dims.get(full_key, 1)
+            data[full_key] = np.ascontiguousarray(raw_state[..., cursor : cursor + dim_k], dtype=np.float32)
+            cursor += dim_k
+        assert cursor == raw_state.shape[-1], f"state dim {raw_state.shape[-1]} != sum(state_key_dims) {cursor}"
+        out = data
+        for t in getattr(self._transform, "transforms", [self._transform]):
+            keys = list(getattr(t, "apply_to", []) or [])
+            if keys and all(k in out for k in keys):
+                out = t.apply(out)
+        parts: List[np.ndarray] = []
+        for full_key in self._state_keys:
+            v = out[full_key]
+            parts.append(np.asarray(v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else v))
+        res = np.concatenate(parts, axis=-1)
+        return res[0] if squeeze else res
+
     def unapply_actions(self, normalized_actions: np.ndarray) -> np.ndarray:
         """Invert action normalization using the training-time pipeline.
 
