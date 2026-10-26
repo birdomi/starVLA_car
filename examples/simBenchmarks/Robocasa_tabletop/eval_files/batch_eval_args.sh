@@ -6,7 +6,7 @@
 ###########################################################################################
 # === Please modify the paths to Python executables in conda environments ===
 
-cd ./starVLA
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 starVLA_PYTHON=~/miniconda3/envs/starVLA/bin/python
 ROBOCASA_PYTHON=~/miniconda3/envs/robocasa/bin/python
 export PYTHONPATH=$(pwd):${PYTHONPATH}
@@ -21,8 +21,10 @@ N_ENVS_DEFAULT=1
 MAX_EPISODE_STEPS_DEFAULT=720
 N_ACTION_STEPS_DEFAULT=12
 
-BASE_PORT=6398
-NUM_GPUS=8
+BASE_PORT=${BASE_PORT:-6398}
+# GPU_IDS: space-separated physical GPU ids to use (default all 8)
+GPU_IDS=(${GPU_IDS:-0 1 2 3 4 5 6 7})
+NUM_GPUS=${#GPU_IDS[@]}
 
 # Parse command-line arguments
 CKPT_PATH=${1:-$CKPT_DEFAULT}
@@ -60,7 +62,8 @@ EvalEnv() {
     # Save root: parent directory of CKPT_PATH
     local SAVE_ROOT=$(dirname "$(dirname "$CKPT_PATH")")
     local ckpt_name=$(basename "$CKPT_PATH" .pt)
-    local VIDEO_OUT_PATH="${SAVE_ROOT}/videos/${ckpt_name}/n_action_steps_${N_ACTION_STEPS}_max_episode_steps_${MAX_EPISODE_STEPS}_n_envs_${N_ENVS}_${ENV_NAME}"
+    # VIDEO_SUFFIX (env, default empty): keeps videos of a re-eval (e.g. another scene-seed set) apart
+    local VIDEO_OUT_PATH="${SAVE_ROOT}/videos${VIDEO_SUFFIX:-}/${ckpt_name}/n_action_steps_${N_ACTION_STEPS}_max_episode_steps_${MAX_EPISODE_STEPS}_n_envs_${N_ENVS}_${ENV_NAME}"
     mkdir -p "${VIDEO_OUT_PATH}"
 
     echo "Launching evaluation | GPU ${GPU_ID} | Port ${PORT} | Env ${ENV_NAME}"
@@ -83,6 +86,9 @@ EvalEnv() {
 # Environment List
 # ============================================================
 
+# EVAL_ENVS: optional whitespace-separated env-name override (e.g. only the 6 *Close tasks).
+# Names may be given bare ("PnPCupToDrawerClose") or fully qualified; bare names are expanded to
+# gr1_unified/<name>_GR1ArmsAndWaistFourierHands_Env. Unset -> the full 24-task list below.
 ENV_NAMES=(
   gr1_unified/PnPCupToDrawerClose_GR1ArmsAndWaistFourierHands_Env
   gr1_unified/PnPPotatoToMicrowaveClose_GR1ArmsAndWaistFourierHands_Env
@@ -110,6 +116,17 @@ ENV_NAMES=(
   gr1_unified/PosttrainPnPNovelFromTrayToTieredshelfSplitA_GR1ArmsAndWaistFourierHands_Env
 )
 
+if [[ -n "${EVAL_ENVS:-}" ]]; then
+    ENV_NAMES=()
+    for NAME in ${EVAL_ENVS}; do
+        if [[ "${NAME}" == *"/"* ]]; then
+            ENV_NAMES+=("${NAME}")
+        else
+            ENV_NAMES+=("gr1_unified/${NAME}_GR1ArmsAndWaistFourierHands_Env")
+        fi
+    done
+fi
+
 # ============================================================
 # Runtime Configuration
 # ============================================================
@@ -130,8 +147,9 @@ echo "Log Directory   : ${LOG_DIR}"
 
 SERVER_PIDS=()
 
-for GPU_ID in $(seq 0 $((NUM_GPUS - 1))); do
-    PORT=$((BASE_PORT + GPU_ID))
+for SLOT in $(seq 0 $((NUM_GPUS - 1))); do
+    GPU_ID=${GPU_IDS[$SLOT]}
+    PORT=$((BASE_PORT + SLOT))
     echo "Starting policy server | GPU ${GPU_ID} | Port ${PORT}"
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} \
@@ -141,7 +159,7 @@ for GPU_ID in $(seq 0 $((NUM_GPUS - 1))); do
         --use_bf16 \
         > "${LOG_DIR}/server_gpu${GPU_ID}_port${PORT}.log" 2>&1 &
 
-    SERVER_PIDS[$GPU_ID]=$!
+    SERVER_PIDS[$SLOT]=$!
 
     sleep 10
 done
@@ -153,9 +171,11 @@ sleep 30
 # ============================================================
 
 COUNT=0
+ENV_PIDS=()
 for ENV_NAME in "${ENV_NAMES[@]}"; do
-    GPU_ID=$((COUNT % NUM_GPUS))
-    PORT=$((BASE_PORT + GPU_ID))
+    SLOT=$((COUNT % NUM_GPUS))
+    GPU_ID=${GPU_IDS[$SLOT]}
+    PORT=$((BASE_PORT + SLOT))
 
     if (( (COUNT + 1) % NUM_GPUS == 0 )); then
         EvalEnv "${GPU_ID}" "${PORT}" "${ENV_NAME}" "${CKPT_PATH}" "${LOG_DIR}" \
@@ -163,6 +183,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
     else
         EvalEnv "${GPU_ID}" "${PORT}" "${ENV_NAME}" "${CKPT_PATH}" "${LOG_DIR}" \
                 "${ROBOCASA_PYTHON}" "${N_ENVS}" "${MAX_EPISODE_STEPS}" "${N_ACTION_STEPS}" &
+        ENV_PIDS+=($!)
     fi
 
     COUNT=$((COUNT + 1))
@@ -174,10 +195,11 @@ done
 # Step 3: Cleanup
 # ============================================================
 
-# Check if there are still evaluation sim processes running
-while pgrep -f "examples/simBenchmarks/Robocasa_tabletop/eval_files/simulation_env.py" > /dev/null; do
-    echo "Waiting for all evaluation environments to finish..."
-    sleep 30
+# Wait for THIS run's evaluation envs only. (A machine-wide `pgrep simulation_env.py` also waited for any
+# other concurrent eval, e.g. a second checkpoint on other GPUs, keeping this run's servers/GPUs busy.)
+echo "Waiting for all evaluation environments to finish..."
+for PID in "${ENV_PIDS[@]}"; do
+    wait "${PID}"
 done
 
 echo ""

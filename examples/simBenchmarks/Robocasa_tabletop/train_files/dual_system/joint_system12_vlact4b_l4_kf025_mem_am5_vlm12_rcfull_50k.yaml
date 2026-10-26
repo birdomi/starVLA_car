@@ -1,0 +1,158 @@
+# QwenGR00T_DualSystem, FULL RoboCasa GR1 set, ONE-STAGE joint training (System 2 + System 1 + episode memory) with
+# the VLM 0.6 s behind (stale_input vlm), as joint_system12_plancond_vlm12_rcfull_50k.yaml except (user 10-15):
+#  * VLM = VLAct Qwen3-VL-4B robot-continued-pretrain (playground/Pretrained_models/VLAct-Qwen3VL4B-Pretrained, base
+#    Qwen3-VL-4B-Instruct-Action, loaded via trainer.reload_modules qwen_vl_interface), only the LAST 4 of its 36
+#    decoder layers + the final norm trained (dual_system.vlm_train_last_layers: 4, float32); vision tower,
+#    embeddings and layers 0-31 frozen (bf16). Plain instruction prompt (VLAct pretrained with "Task: ..., State:
+#    <256-bin state>; Please predict ..." - not reproduced).
+#  * System 2 keyframes every 0.25 s (user 10-15; first prepared at 0.5 s): -2 .. +4 s -> 25 keyframes (8 past / current /
+#    16 future), absolute plan. GT representation floor on the System 1 window (scratchpad delta_repr_err_dt025.log /
+#    _dt05.log, 256 samples, abs-normalised RMSE, arms+waist / hands): 0.25 s absolute 0.016 / 0.114 vs per-step-delta
+#    (least squares) 0.035 / 0.097; 0.5 s absolute 0.020 / 0.177; 0.1 s absolute 0.012 / 0.068 -> absolute plan (no
+#    delta_plan). System 1 predicts the actions directly (no s1_residual: its x10 scale was tuned for the 0.1 s plan's
+#    ~0.08 error on the System 1 window).
+#  * System 1 = ActionMap (user 10-15): 16 steps x 5 columns L_arm a[0:7] | R_arm a[7:14] | L_hand a[14:20] | R_hand
+#    a[20:26] | waist a[26:29] (own input Linear, group embedding and zero-init output per column) = 80 action cells;
+#    the plan is not split (25 trajectory tokens, plan_input condition); flow source noise N(0, 1) on every column
+#    (the low arm / waist noise run stage2_system1_am5_lownoise_on_s1res10_50k: 19.4% vs 38.9% on 175 paired eps).
+#  * episode memory (dual_system.memory, the car design of joint_e2e_vlm15_relplan_holdcap05_mem_ft46k_v2_carturn_3cam):
+#    16 tokens 768-d 2 layers over the VLM's last hidden states, unrolled from the learned init over the VLM frames
+#    t - 48 / -36 / -24 / -12 (0.6 s apart = the sim's call period, n_action_steps 12; frames before the episode skip
+#    their update), all encoded without gradient; + progress t / (T - 1) in 50 classes (CE x 0.1) -> 1 token; System 2
+#    cross-attends [VLM, C-RADIO prefix, C-RADIO, state, memory x 16, progress]. Sim eval: ROBOCASA_VLM_PREV_FRAMES=4
+#    (client sends the last 4 calls' frames + frame t with frame_valid; predict_action runs the same window unroll).
+#  * System 2's VLM tokens (frame t - 12, frame t where that lies before the episode) are encoded again WITH gradient
+#    for the trainable layers.
+# Chain: dual_system/run_dualsystem_vlact4b_mem.sh (train -> seeded 24-task sim eval with the VLM lag + memory window).
+run_id: starvla_dualsystem_joint_vlact4b_l4_kf025_mem_am5_vlm12_h16_rcfull_robocasa_gr1
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: ryk9012-gwangju-institute-of-science-and-technology
+wandb_project: starVLA_robocasa
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T_DualSystem
+  qwenvl:
+    base_vlm: playground/Pretrained_models/Qwen3-VL-4B-Instruct-Action   # VLAct's base (vocab 153984 = + 2048 action tokens)
+    attn_implementation: sdpa   # QWen3.py always uses sdpa
+    torch_dtype: bfloat16   # QWen3.py loads bf16 (this key is not read); the trained last layers are cast to fp32
+  radio:
+    path: playground/Pretrained_models/C-RADIOv4-SO400M   # smallest released C-RADIOv4 (H / SO400M / 1D-H only)
+    feature: backbone
+    input_size: [256, 256]
+    outlier_norm: 100.0     # C-RADIO's fixed top-row artifact token (1 of 256) is masked
+    prefix_tokens: summary  # SigLIP2-g + DINOv3 CLS (RADIO's 2304-d summary, 2 x 1152 tokens) -> both systems
+  dual_system:
+    action_rate_hz: 20.0
+    keyframes: {t_min: -2.0, t_max: 4.0, dt: 0.25}   # 25 keyframes: 8 past / 1 current / 16 future
+    s1_horizon_s: 0.8       # 16 actions (0.8 s chunk)
+    video_offsets: [-48, -36, -24, -12, 0]   # == data config video delta_indices (fourier_gr1_arms_waist_dual_vlm12mem): memory frames, VLM frame t - 12, current frame
+    stale_input: vlm        # Qwen tokens of frame t - 12; C-RADIO / state / System 1 at t
+    s1_offset_probs: [0.0, 0.0, 0.0, 1.0, 0.0]   # System 2's VLM tokens: always frame t - 12 (frame t where t - 12 lies before the episode)
+    frame_size: [256, 256]  # == obs_image_size
+    train_systems: [system2, system1]
+    loss_weights: {system2: 1.0, system1: 1.0}
+    mask_out_of_episode: true
+    vlm_train_last_layers: 4   # VLM: only decoder layers 32-35 + final norm trained (fp32); trainer.freeze_modules must not list qwen_vl_interface
+    memory:
+      update_offsets: [-48, -36, -24, -12]   # 4 updates, 0.6 s apart = the sim's call period (training); the eval client sends the same window
+      num_tokens: 16
+      d_model: 768
+      depth: 2
+      num_heads: 12
+      mlp_ratio: 4.0
+      progress_bins: 50
+      progress_loss_weight: 0.1
+    eval: {num_samples: 64, seed: 0}
+  system2:
+    use_radio_prefix: true # C-RADIO summary tokens (SigLIP2-g / DINOv3 CLS = 2304-d summary) in s2_context
+    d_model: 768
+    depth: 12
+    num_heads: 12
+    use_state: true
+    vlm_age_embed: false    # no age MLP on the VLM tokens (the lag is fixed at 0.6 s; 0 only within the first 12 frames)
+    num_noise_samples: 4    # noise draws per sample per step (the DiT is cheap next to the VLM)
+    diffusion: {type: flow_matching, beta_alpha: 1.5, beta_beta: 1.0, noise_s: 0.999, num_timestep_buckets: 1000, sample_steps: 4}  # GR00T
+    interpolation: {default_mode: linear, groups: [], strict: true}   # GR1 arms / hands / waist are all continuous
+  system1:
+    use_radio_prefix: true # current frame's C-RADIO summary tokens in the cross-attention context
+    d_model: 768           # same size as the System 2 DiT / the GR00T action head
+    depth: 12
+    num_heads: 12
+    use_state: true         # state at frame t (the System 1 frame) as one token
+    plan_input: condition   # trajectory tokens in the cross-attention memory (not the sequence)
+    state_input: condition  # state token stays in the cross-attention memory
+    action_map:             # ActionMap System 1: 16 steps x 5 columns (loader order left_arm, right_arm, left_hand, right_hand, waist)
+      groups: ["0:7", "7:14", "14:20", "20:26", "26:29"]
+      names: [L_arm, R_arm, L_hand, R_hand, waist]
+      plan_grid: false      # 25 plan tokens (the plan is not split per column)
+      # noise_std unset: flow source noise N(0, 1) on every column
+    num_noise_samples: 4
+    diffusion: {type: flow_matching, beta_alpha: 1.5, beta_beta: 1.0, noise_s: 0.999, num_timestep_buckets: 1000, sample_steps: 4}  # GR00T
+    traj_source: pred       # System 2's own sampled plan (no_grad), exactly what System 1 sees at test time
+    traj_pred_steps: 4      # Euler steps of System 2's plan (= inference)
+  action_model:             # action / state layout (QwenGR00T keys)
+    action_dim: 29
+    state_dim: 58           # sin/cos state
+    action_horizon: 16      # = System 1 horizon (the policy server's chunk length)
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    emit_action_valid: true # action_valid / frame_valid masks (padded slots outside the episode)
+    data_root_dir: playground/Datasets/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim
+    emit_progress: true     # t / (T - 1) -> the memory's progress classes
+    data_mix: fourier_gr1_unified_1000_dual_vlm12mem   # ego / state at t + {-48, -36, -24, -12, 0} + a[t-40 .. t+80]
+    lerobot_version: "v2.0"
+    sequential_step_sampling: false
+    per_device_batch_size: 32   # 32 x 4 GPUs = global 128
+    load_all_data_for_training: true
+    obs_image_size: [256, 256]
+    delete_pause_frame: false
+    video_backend: decord
+    video_backend_kwargs: {num_threads: 1}
+    multiprocessing_context: fork
+    num_workers: 8
+    prefetch_factor: 2
+  val_data:   # demos 900-999 of each task (INSIDE the training set here), eval hook only
+    dataset_py: lerobot_datasets
+    include_state: true
+    emit_action_valid: true
+    data_root_dir: playground/Datasets/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim
+    emit_progress: true
+    data_mix: fourier_gr1_unified_1000_dual_vlm12mem
+    skip_first_episodes: 900
+    max_episodes_per_dataset: 100
+    lerobot_version: "v2.0"
+    obs_image_size: [256, 256]
+    video_backend: decord
+    video_backend_kwargs: {num_threads: 1}
+
+trainer:
+  max_train_steps: 50000
+  num_warmup_steps: 1000
+  save_interval: 10000
+  eval_interval: 1000
+  learning_rate:
+    base: 1.0e-05           # qwen_vl_interface: its last 4 decoder layers + final norm
+    system2: 1.0e-04
+    system1: 1.0e-04
+    episode_memory: 1.0e-04 # new module (memory transformer + progress head / token)
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr_rate: 0.01
+  pretrained_checkpoint: playground/Pretrained_models/VLAct-Qwen3VL4B-Pretrained/checkpoints/steps_100000_pytorch_model.pt
+  reload_modules: qwen_vl_interface   # VLAct's VLM only (its oft / gr00t / pi heads are not loaded)
+  freeze_modules: radio_encoder   # NOT qwen_vl_interface (dual_system.vlm_train_last_layers freezes all but its last 4 layers)
+  max_grad_norm: 1.0
+  logging_frequency: 100
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 0.0

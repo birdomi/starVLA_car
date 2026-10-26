@@ -2,6 +2,7 @@ from collections import deque
 from typing import Dict, Optional
 
 import cv2 as cv
+import os
 import numpy as np
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
@@ -65,6 +66,22 @@ class ModelClient:
         self.action_chunk_size = None
         self.state_norm_stats = None
         self.raw_actions = None
+        # Env layout of joint vectors is [left 6, left gripper, right 6, right gripper]; the model
+        # (AgilexDataConfig action/state keys) uses [left 6, right 6, left gripper, right gripper].
+        self.env_to_model = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 6, 13]
+        self.model_to_env = [0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13]
+        # ROBOTWIN_SEND_STATE=1: send the raw state (model order) as ``state_raw``; the server normalizes it
+        # with the training-time state transform. Required for models trained with include_state: true.
+        self.send_state = os.environ.get("ROBOTWIN_SEND_STATE", "0") == "1"
+        # ROBOTWIN_NUM_PAST_STEPS=P (>0): keep the last P executed actions (model order, env units) and send
+        # them as ``past_action_abs`` + ``current_qpos`` for history-conditioned heads (QwenGR00T_PatchRegressor).
+        self.num_past_steps = int(os.environ.get("ROBOTWIN_NUM_PAST_STEPS", "0"))
+        # ROBOTWIN_STATE_HIST=H (>0): send the last H OBSERVED states (model order, env units) as ``state_raw``
+        # (H, 14); the server normalizes each step. For heads with past_source: state (image2image over states).
+        self.state_hist = int(os.environ.get("ROBOTWIN_STATE_HIST", "0"))
+        self._state_hist = deque(maxlen=max(self.state_hist, 1))
+        self._hist = deque(maxlen=max(self.num_past_steps, 1))
+        print(f"*** robotwin client: send_state={self.send_state} num_past_steps={self.num_past_steps} ***")
 
         server_meta = self.client.get_server_metadata()
         self.action_chunk_size = server_meta["action_chunk_size"]
@@ -84,6 +101,8 @@ class ModelClient:
         # Reset state tracking for delta/rel modes
         self.initial_state = None
         self.prev_action = None
+        self._hist.clear()
+        self._state_hist.clear()
 
     def step(
         self,
@@ -116,6 +135,20 @@ class ModelClient:
         example["image"] = images
         example_copy = example.copy()
         example_copy.pop("state")
+        qpos_model = np.asarray(state, dtype=np.float32)[self.env_to_model] if state is not None else None
+        if qpos_model is not None and self.state_hist > 0:
+            self._state_hist.append(qpos_model.copy())
+            h = list(self._state_hist)
+            pad = [qpos_model] * (self.state_hist - len(h))
+            example_copy["state_raw"] = np.stack(pad + h, axis=0).astype(np.float32)  # (H, 14) chronological, ends at s[t]
+        elif self.send_state and qpos_model is not None:
+            example_copy["state_raw"] = qpos_model  # (14,) model order, env units -> server normalizes
+        if self.num_past_steps > 0 and qpos_model is not None:
+            h = list(self._hist)
+            pad = [qpos_model] * (self.num_past_steps - len(h))  # before the first step: "no motion"
+            example_copy["past_action_abs"] = np.stack(pad + h, axis=0).astype(np.float32)  # (P, 14) chronological
+            example_copy["current_qpos"] = qpos_model
+            example_copy["past_mode"] = self.action_mode if self.action_mode in ("rel", "abs") else "delta"
         vla_input = {
             "examples": [example_copy],
             "do_sample": False,
@@ -159,7 +192,9 @@ class ModelClient:
         if self.action_mode == "delta":
             self.prev_action = current_action.copy()
 
-        current_action = current_action[[0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13]]
+        if self.num_past_steps > 0:
+            self._hist.append(np.asarray(current_action, dtype=np.float32).copy())  # model order, env units
+        current_action = current_action[self.model_to_env]
         return current_action
 
     def _delta_to_absolute(self, delta_actions: np.ndarray, current_state: np.ndarray) -> np.ndarray:

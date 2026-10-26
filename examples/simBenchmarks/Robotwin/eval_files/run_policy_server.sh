@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
@@ -25,8 +25,10 @@ echo "[INFO] Starting RoboTwin policy server"
 echo "[INFO] checkpoint: ${your_ckpt}"
 echo "[INFO] gpu: ${gpu_id}"
 echo "[INFO] port: ${port}"
+echo "[INFO] idle_timeout: ${ROBOTWIN_SERVER_IDLE_TIMEOUT:--1} (RoboTwin expert checks can leave the server idle >30 min; never auto-close)"
 
 CUDA_VISIBLE_DEVICES="${gpu_id}" "${star_vla_python}" "${REPO_ROOT}/deployment/model_server/server_policy.py" \
     --ckpt_path "${your_ckpt}" \
     --port "${port}" \
+    --idle_timeout "${ROBOTWIN_SERVER_IDLE_TIMEOUT:--1}" \
     "${use_bf16_flag[@]}"

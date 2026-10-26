@@ -16,7 +16,16 @@ import dataclasses
 import json
 import logging
 import os
+import sys
 import time
+
+if __name__ == "__main__" and "PYTHONHASHSEED" not in os.environ:
+    # RoboCasa picks distractor objects by iterating hash-ordered sets of names, so the scene for a given
+    # seed changes with Python's per-process string-hash salt. Pin it (re-exec: it only takes effect at
+    # interpreter start) so seeded episodes are identical across processes / checkpoints.
+    # Set PYTHONHASHSEED=random explicitly to opt out.
+    os.environ["PYTHONHASHSEED"] = "0"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -71,6 +80,9 @@ class SimulationConfig:
     env_name: str
     n_episodes: int = 2
     n_envs: int = 1
+    # Episode i starts from scene seed `seed + i`, so every checkpoint is evaluated on the SAME scenes
+    # (paired comparison). None = legacy unseeded behaviour (scenes differ run to run).
+    seed: Optional[int] = None
     video: VideoConfig = field(default_factory=VideoConfig)
     multistep: MultiStepConfig = field(default_factory=MultiStepConfig)
 
@@ -135,7 +147,7 @@ class SimulationInferenceEnv:
         current_successes = [False] * config.n_envs
         episode_successes = []
         # Initial environment reset
-        obs, _ = self.env.reset()
+        obs, _ = self._reset(config, 0)
         # Main simulation loop
         while completed_episodes < config.n_episodes:
             # Process observations and get actions from the model
@@ -144,18 +156,29 @@ class SimulationInferenceEnv:
             next_obs, rewards, terminations, truncations, env_infos = self.env.step(actions)
             # Update episode tracking
             for env_idx in range(config.n_envs):
-                current_successes[env_idx] |= bool(env_infos["success"][env_idx][0])
+                # [-1] = the newest per-env-step flag (chunk end). The wrapper keeps max_steps_needed flags, which is 1
+                # by default but 16 with ROBOCASA_STATE_HIST=16 -- [0] would then read the flag 15 steps stale
+                # and miss successes in the last 15 steps of an episode.
+                current_successes[env_idx] |= bool(env_infos["success"][env_idx][-1])
                 current_rewards[env_idx] += rewards[env_idx]
                 current_lengths[env_idx] += 1
                 # If episode ended, store results
                 if terminations[env_idx] or truncations[env_idx]:
                     episode_lengths.append(current_lengths[env_idx])
                     episode_successes.append(current_successes[env_idx])
+                    # per-episode record (any-step success) for episode-level paired comparisons across checkpoints
+                    seed_str = "-" if config.seed is None else str(int(config.seed) + completed_episodes)
+                    print(f"[episode] idx={completed_episodes} seed={seed_str} success={int(current_successes[env_idx])}", flush=True)
                     current_successes[env_idx] = False
                     completed_episodes += 1
                     # Reset trackers for this environment
                     current_rewards[env_idx] = 0
                     current_lengths[env_idx] = 0
+                    if hasattr(self.model, "reset_episode"):  # per-episode client state (vector env autoreset too)
+                        self.model.reset_episode(env_idx)
+                    if config.seed is not None and completed_episodes < config.n_episodes:
+                        # explicit seeded reset instead of the vector env's (unseeded) autoreset
+                        next_obs, _ = self._reset(config, completed_episodes)
             obs = next_obs
         # Clean up
         self.env.reset()
@@ -166,6 +189,22 @@ class SimulationInferenceEnv:
             len(episode_successes) >= config.n_episodes
         ), f"Expected at least {config.n_episodes} episodes, got {len(episode_successes)}"
         return config.env_name, episode_successes
+
+    def _reset(self, config: SimulationConfig, episode_idx: int):
+        """Reset; with config.seed, episode `episode_idx` gets the reproducible scene `seed + episode_idx`."""
+        if hasattr(self.model, "reset_episode"):
+            self.model.reset_episode()
+        if config.seed is None:
+            return self.env.reset()
+        assert config.n_envs == 1, "seeded evaluation supports n_envs == 1 only"
+        seed = int(config.seed) + episode_idx
+        # RoboCasa samples the scene (layout, objects, placements, textures) from the robosuite env's own
+        # numpy Generator `rng`; gym reset(seed) only seeds the GLOBAL np.random (robot init noise).
+        # Re-seed the Generator IN PLACE so samplers holding a reference to it follow too.
+        inner = self.env.envs[0].unwrapped.env
+        inner.rng.bit_generator.state = np.random.default_rng(seed).bit_generator.state
+        print(f"[seeded reset] episode {episode_idx} -> scene seed {seed}")
+        return self.env.reset(seed=seed)
 
     def _get_actions_from_model(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """Process observations and get actions from the model."""
@@ -219,6 +258,7 @@ def run_evaluation(
     n_envs: int = 1,
     n_action_steps: int = 2,
     max_episode_steps: int = 100,
+    seed: Optional[int] = None,
 ) -> Tuple[str, List[bool]]:
     """
     Simple entry point to run a simulation evaluation.
@@ -230,6 +270,7 @@ def run_evaluation(
         n_envs: Number of parallel environments
         n_action_steps: Number of action steps per environment step
         max_episode_steps: Maximum number of steps per episode
+        seed: Base scene seed (episode i uses seed + i); None = unseeded
     Returns:
         Tuple of environment name and list of episode success flags
     """
@@ -238,8 +279,17 @@ def run_evaluation(
         env_name=env_name,
         n_episodes=n_episodes,
         n_envs=n_envs,
+        seed=seed,
         video=VideoConfig(video_dir=video_dir),
-        multistep=MultiStepConfig(n_action_steps=n_action_steps, max_episode_steps=max_episode_steps),
+        multistep=MultiStepConfig(
+            n_action_steps=n_action_steps,
+            max_episode_steps=max_episode_steps,
+            # ROBOCASA_STATE_HIST=H: the state-history (state2action) PatchRegressor needs the last H env-step
+            # states s[t-H+1..t]; the policy is only called once per action chunk, so the wrapper must return the
+            # per-step window (N, H, D). Default: current state only (N, 1, D).
+            **({"state_delta_indices": np.arange(-int(os.environ.get("ROBOCASA_STATE_HIST", "0")) + 1, 1)}
+               if int(os.environ.get("ROBOCASA_STATE_HIST", "0")) > 0 else {}),
+        ),
     )
     # Create client and run simulation
     client = SimulationInferenceEnv(model=model)
@@ -276,7 +326,7 @@ class Args:
         "experiments/1029_qwenGR00T_fourier_gr1_unified_1000_PnPMilkToMicrowaveClose_gpus_woPretrain_wState/checkpoints/steps_20000_pytorch_model.pt.log/gr1_unified/logs/PnPMilkToMicrowaveClose_GR1ArmsAndWaistFourierHands_Env"  # Path to save videos
     )
 
-    seed: int = 7  # Random Seed (for reproducibility)
+    seed: int = 7  # Base scene seed: episode i uses seed + i (same scenes for every checkpoint); < 0 = unseeded
 
     pretrained_path: str = (
         "results/Checkpoints/1029_qwenGR00T_fourier_gr1_unified_1000_PnPMilkToMicrowaveClose_gpus_woPretrain_wState/checkpoints/steps_20000_pytorch_model.pt"
@@ -305,6 +355,7 @@ def eval_gr1_unified(args: Args) -> None:
         n_envs=args.n_envs,
         n_action_steps=args.n_action_steps,
         max_episode_steps=args.max_episode_steps,
+        seed=args.seed if args.seed >= 0 else None,
     )
 
 

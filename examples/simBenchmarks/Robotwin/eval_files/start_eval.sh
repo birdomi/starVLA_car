@@ -486,6 +486,7 @@ ckpt_name="$(basename "${CKPT_PATH}")"
 ckpt_stem="${ckpt_name%.*}"
 timestamp="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="${ROBOTWIN_LOG_ROOT:-$(dirname "${CKPT_PATH}")/robotwin_eval_logs/${POLICY_NAME}_${TASK_CONFIG}_${ckpt_stem}_${timestamp}}"
+LOG_DIR="$(readlink -m "${LOG_DIR}")"  # eval.sh cd's into RoboTwin, so the log dir must be absolute
 mkdir -p "${LOG_DIR}"
 
 next_port="${BASE_PORT}"

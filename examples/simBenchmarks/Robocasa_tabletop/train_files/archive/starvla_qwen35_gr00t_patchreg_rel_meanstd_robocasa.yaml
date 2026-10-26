@@ -1,0 +1,93 @@
+# Qwen3.5-0.8B + GR00T PATCH regressor: (16 x 29) chunk as a 2-D grid, (4 x joint-group) patches, axial RoPE,
+# past 16 executed actions as patch tokens (deltas from the past-window start), targets = per-step deltas.
+# Targets: rel (a[t+i]-s[t]) with mean_std normalization; past = rel history re-anchored at its start. Hyperparameters copied from the H1-2 car run
+# (examples/realRobots/H1_2_car/train_files/starvla_qwengr00t_car3task_100k.yaml) on RoboCasa GR1 tabletop (24 tasks x 1000, ego view, 29-D action, 58-D sin/cos state)
+# Launch: bash examples/simBenchmarks/launch_regressor_sim_local.sh examples/simBenchmarks/Robocasa_tabletop/train_files/starvla_qwen35_gr00t_patchreg_rel_meanstd_robocasa.yaml [gpus] [port]
+run_id: starvla_qwen35_0_8b_gr00t_patchreg_rel_meanstd_robocasa_gr1
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: ryk9012-gwangju-institute-of-science-and-technology
+wandb_project: starVLA_robocasa
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T_PatchRegressor
+  qwenvl:
+    base_vlm: Qwen/Qwen3.5-0.8B
+    attn_implementation: flash_attention_2
+    # ZeRO-0 (needed by Muon) keeps no fp32 master copy, so the trained VLM
+    # must hold fp32 weights; compute stays bf16 via autocast.
+    torch_dtype: float32
+    load_bf16: false
+  action_model:
+    action_dim: 29
+    state_dim: 58
+    action_horizon: 16     # future steps (regression target)
+    num_past_steps: 16     # executed-action history fed as patch tokens
+    patch_t: 4             # time patch size -> 4 time patches
+    patch_groups: [7, 7, 6, 6, 3]  # left_arm, right_arm, left_hand, right_hand, waist -> 5 column groups
+    past_repr: from_start  # past window re-anchored at its start (rel: subtract the first past slot)
+    target_mode: rel
+    use_rope: true         # axial (time, group) RoPE in the DiT self-attention
+    rope_theta: 10000.0
+    loss_type: l1
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: playground/Datasets/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim
+    data_mix: fourier_gr1_unified_1000_pf32_meanstd_rel   # range(-16, 16) window, z-scored, rel targets
+    lerobot_version: "v2.0"
+    action_mode: rel          # a[t+i] - s[t] for every slot: no error accumulation (client adds the current qpos)
+    sequential_step_sampling: false
+    # 32 x 4 GPUs = global batch 128 (grad_accum 1)
+    per_device_batch_size: 32
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    delete_pause_frame: false
+    video_backend: decord
+    video_backend_kwargs: {num_threads: 1}
+    multiprocessing_context: fork
+    num_workers: 16
+    preprocess_in_workers: true
+    prefetch_factor: 2
+
+trainer:
+  # Same recipe as the H1-2 car run: Muon (action head only) + WSD, VLM trained with AdamW @ 1e-5.
+  max_train_steps: 50000
+  num_warmup_steps: 5000
+  save_interval: 5000
+  eval_interval: 500
+  learning_rate:
+    base: 1.0e-05
+    action_model: 1.0e-04
+  # WSD: warmup 0-5k -> stable 5k-40k -> cosine decay 40k-50k
+  lr_scheduler_type: warmup_stable_decay
+  scheduler_specific_kwargs:
+    num_decay_steps: 10000
+    min_lr_ratio: 0.01
+  # VLM trains too: Muon is restricted to the action_model group via
+  # optimizer.muon_modules; Qwen falls in the 'base' group -> pure AdamW @ 1e-5.
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 100
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+
+  # torch.optim.Muon for 2D matrices of the action head, AdamW for the rest.
+  # REQUIRES ZeRO stage 0 (launch_regressor_sim_local.sh sets ACCELERATE_DEEPSPEED_ZERO_STAGE=0).
+  optimizer:
+    name: Muon
+    muon_modules: [action_model]
+    muon_lr: 1.0e-04
+    muon_weight_decay: 1.0e-05
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-05
