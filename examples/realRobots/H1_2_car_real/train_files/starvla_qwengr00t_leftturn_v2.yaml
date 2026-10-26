@@ -1,0 +1,89 @@
+run_id: starvla_qwengr00t_dit_leftturn_v2
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: ryk9012-gwangju-institute-of-science-and-technology
+wandb_project: starVLA_h1_2_car
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T
+  qwenvl:
+    base_vlm: Qwen/Qwen3.5-0.8B
+    attn_implementation: flash_attention_2
+  action_model:
+    action_dim: 42   # head(2) + arms(14) + hands(26)
+    state_dim: 42    # head_cmd(2) + arms(14) + hands(26); measured head is not an input
+    action_horizon: 30   # 1.0 s at 30 Hz
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /mnt/DATA2/yyg/starVLA/playground/Datasets
+    data_mix: car_left_turn_v2
+    lerobot_version: "v3.0"
+    # head and arms are relative to the state group they track. The head is
+    # anchored on `head_cmd`, not on the measured head: the measured head trails
+    # the command by ~1.0 s in yaw with gain 0.63, so |action - measured head|
+    # exceeds 10 deg on 22.9% of frames (30 deg on 3.9%) while
+    # |action - head_cmd| stays at 1.42 deg mean. The measured head is the camera
+    # pose, an observation, not a control target, and it is not a state input
+    # either (the front_view image already carries it).
+    action_mode: rel
+    action_mode_apply_keys:
+      - action.head
+      - action.left_arm
+      - action.right_arm
+    action_mode_state_map:
+      action.head: state.head_cmd
+      action.left_arm: state.left_arm
+      action.right_arm: state.right_arm
+    sequential_step_sampling: false
+    per_device_batch_size: 32   # global batch 128 (32 x 4 GPUs)
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    delete_pause_frame: false
+    video_backend: torchcodec_cuda
+    multiprocessing_context: spawn   # torchcodec_cuda cannot init CUDA in forked workers
+    num_workers: 4
+    prefetch_factor: 4
+    in_order: false
+
+trainer:
+  # 412k frames (15x the car-real set): 40k steps x batch 128 = 5.1M samples,
+  # about 12 epochs — the regime the 0820 runs sat in, not the 300+ epochs
+  # car-real needed. Checkpoints every 5k so the best one can be picked.
+  max_train_steps: 40000
+  num_warmup_steps: 1500
+  save_interval: 5000
+  eval_interval: 500
+  learning_rate:
+    base: 1.0e-05
+    action_model: 1.0e-04
+  # WSD: warmup 0-1.5k -> stable 1.5k-32k -> cosine decay 32k-40k
+  lr_scheduler_type: warmup_stable_decay
+  scheduler_specific_kwargs:
+    num_decay_steps: 8000
+    min_lr_ratio: 0.01
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+
+  # Muon on the action head's 2D matrices only; the VLM stays on plain AdamW.
+  # REQUIRES ZeRO stage 0 (launch with ACCELERATE_DEEPSPEED_ZERO_STAGE=0).
+  optimizer:
+    name: Muon
+    muon_modules: [action_model]
+    muon_lr: 1.0e-04
+    muon_weight_decay: 1.0e-05
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-05

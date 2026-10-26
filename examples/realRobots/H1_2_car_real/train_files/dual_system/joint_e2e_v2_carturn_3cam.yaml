@@ -1,0 +1,124 @@
+# QwenGR00T_DualSystem on car-turn-signal-v2-ep, JOINT ("end-to-end") training: System 2 and System 1 in one run
+# (train_systems [system2, system1], loss = S2 dense flow-matching loss + S1 flow-matching loss, weights 1 / 1).
+#   - Qwen3.5-0.8B fully trainable (lr 1e-5), System 2 DiT (lr 1e-4) and System 1 DiT (lr 1e-4) from scratch; C-RADIO frozen.
+#   - System 1 sees System 2's OWN sampled plan (4 Euler steps, no gradient -> S1's loss does not reach S2 / Qwen), with
+#     keyframe token dropout 0.2, a 50-step chunk (1.67 s) and plan ages {0, 6, 12, 18, 24} frames, exactly as
+#     stage2_system1_h50_tdrop_v2_carturn_3cam.yaml; System 2 / data / ColorJitter as stage1_system2_v2_carturn_3cam.yaml.
+#   - Early on System 2 is untrained, so System 1 first learns from poor plans (and from the observation / state).
+# Chain: run_dualsystem_v2_e2e_carturn.sh. Launch: bash ../run_car_yaml.sh <this yaml> <gpus> <port>
+run_id: starvla_dualsystem_v2_e2e_carturn_3cam
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: ryk9012-gwangju-institute-of-science-and-technology
+wandb_project: starVLA_h1_2_car
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T_DualSystem
+  qwenvl:
+    base_vlm: Qwen/Qwen3.5-0.8B
+    attn_implementation: flash_attention_2
+    torch_dtype: float32    # trained -> fp32 weights (ZeRO-0 keeps no fp32 master copy); compute is bf16 autocast
+    load_bf16: false
+  radio:
+    path: playground/Pretrained_models/C-RADIOv4-SO400M   # smallest released C-RADIOv4 (H / SO400M / 1D-H only)
+    feature: backbone
+    input_size: [224, 224]  # == frame_size (the car runs' 224 x 224 views)
+    outlier_norm: 100.0     # C-RADIO's fixed top-row artifact token is masked
+    prefix_tokens: summary  # SigLIP2-g + DINOv3 CLS (RADIO's 2304-d summary, 2 x 1152 tokens) -> both systems
+  dual_system:
+    action_rate_hz: 30.0    # car video / action rate
+    keyframes: {t_min: -2.0, t_max: 4.0, dt: 0.1}   # 61 keyframes: 20 past / 1 current / 40 future
+    s1_horizon_s: 1.6666666666666667   # 50 actions (round(s1_horizon_s * 30))
+    video_offsets: [0, 6, 12, 18, 24]   # == data config video delta_indices (h1_2_car_turn_dual); S2 uses offset 0
+    num_views: 3            # head_left_2, wrist_left_2, wrist_right_2 (data config video_keys order)
+    frame_size: [224, 224]  # == obs_image_size
+    train_systems: [system2, system1]   # joint
+    loss_weights: {system2: 1.0, system1: 1.0}
+    mask_out_of_episode: true
+    eval: {num_samples: 64, seed: 0}
+  system2:
+    use_radio_prefix: true # C-RADIO summary tokens (SigLIP2-g / DINOv3 CLS = 2304-d summary) in s2_context
+    d_model: 768
+    depth: 12
+    num_heads: 12
+    use_state: true
+    num_noise_samples: 4    # noise draws per sample per step (the DiT is cheap next to the VLM)
+    diffusion: {type: flow_matching, beta_alpha: 1.5, beta_beta: 1.0, noise_s: 0.999, num_timestep_buckets: 1000, sample_steps: 4}  # GR00T
+    interpolation: {default_mode: linear, groups: [], strict: true}   # head / arms / hands are all continuous
+  system1:
+    use_radio_prefix: true # current frame's C-RADIO summary tokens in the cross-attention context
+    d_model: 768           # same size as the System 2 DiT / the GR00T action head
+    depth: 12
+    num_heads: 12
+    use_state: true         # state at the System 1 frame (t + o) as a cross-attention token
+    num_noise_samples: 4
+    diffusion: {type: flow_matching, beta_alpha: 1.5, beta_beta: 1.0, noise_s: 0.999, num_timestep_buckets: 1000, sample_steps: 4}  # GR00T
+    traj_source: pred       # System 2's own sampled plan (no_grad), exactly what System 1 sees at test time
+    traj_pred_steps: 4      # Euler steps of System 2's plan (= inference)
+    traj_token_dropout: 0.2 # each trajectory token -> learned mask token w.p. 0.2 (training only)
+    grad_ckpt: true         # recompute the System 1 DiT blocks in backward (same math; S2 + S1 at b32 peaked 92 GB of 98)
+  action_model:             # action / state layout (QwenGR00T keys)
+    action_dim: 42
+    state_dim: 40           # arms(14) + hands(26), no head_cmd, no sin/cos
+    action_horizon: 50      # = System 1 horizon (50 / 30 s)
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    emit_action_valid: true # action_valid / frame_valid masks (padded slots outside the episode)
+    data_root_dir: /mnt/DATA2/yyg/starVLA/playground/Datasets
+    data_mix: car_turn_signal_v2_dual_nohc   # 3 views / 40-D state at t + {0, 6, 12, 18, 24} + a[t-60 .. t+120] (head = raw head[t])
+    # photometric augmentation (train split only): one ColorJitter draw per sample shared by all 3 cameras and all
+    # time offsets (a global exposure / white-balance shift, as between the collection and the deployment camera).
+    # brightness x[0.6, 1.4], contrast x[0.6, 1.4] (lifts / lowers the black level too), saturation x[0.6, 1.4], hue +-0.05
+    color_jitter: {brightness: 0.4, contrast: 0.4, saturation: 0.4, hue: 0.05}
+    min_episode_length: 150
+    lerobot_version: "v3.0"
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 32   # 32 x 4 GPUs = global 128
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    delete_pause_frame: false
+    video_backend: torchcodec_cuda   # launch with STARVLA_CUDA_DECODER_CACHE=150 (run_car_yaml.sh caller)
+    multiprocessing_context: spawn   # torchcodec_cuda cannot init CUDA in forked workers
+    num_workers: 6
+    cache_parquet_tables: true
+    prefetch_factor: 6
+    in_order: false
+  val_data:   # held-out val split (60 episodes), eval hook only; decoded once and cached -> CPU decoding
+    dataset_py: lerobot_datasets
+    include_state: true
+    emit_action_valid: true
+    data_root_dir: /mnt/DATA2/yyg/starVLA/playground/Datasets
+    data_mix: car_turn_signal_v2_val_dual_nohc
+    lerobot_version: "v3.0"
+    action_mode: abs
+    obs_image_size: [224, 224]
+    video_backend: torchcodec
+
+trainer:
+  max_train_steps: 50000
+  num_warmup_steps: 1000
+  save_interval: 10000
+  eval_interval: 1000
+  learning_rate:
+    base: 1.0e-05           # qwen_vl_interface (full fine-tuning)
+    system2: 1.0e-04
+    system1: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr_rate: 0.01
+  freeze_modules: radio_encoder
+  max_grad_norm: 1.0
+  logging_frequency: 100
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 0.0

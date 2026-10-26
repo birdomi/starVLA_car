@@ -1,0 +1,114 @@
+# QwenGR00T_TriSystem, stage 2: System 1 pretraining (Action DiT, GR00T-style flow matching on action chunks).
+#   Action DiT(A_tau | dZ, state) with the GROUND-TRUTH change dZ = Z_f - Z_t (teacher forcing). Starts from the
+#   stage-1 checkpoint (full load, strict=False): the trained System 1.5 is carried along frozen, so the eval
+#   hook already reports actions from System 1.5's dZ_hat (rmse_pred) next to the GT-dZ actions (rmse_gt_delta).
+run_id: starvla_trisystem_s1_carfew_v1_front
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: ryk9012-gwangju-institute-of-science-and-technology
+wandb_project: starVLA_h1_2_car
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T_TriSystem
+  qwenvl:   # System 2, used unmodified
+    base_vlm: Qwen/Qwen3.5-0.8B
+    attn_implementation: flash_attention_2
+    torch_dtype: bfloat16   # frozen; use float32 if Qwen is fine-tuned (ZeRO-0 keeps no fp32 master copy)
+  radio:
+    path: playground/Pretrained_models/C-RADIOv4-SO400M
+    feature: backbone       # backbone | penultimate | siglip2-g | dino_v3_7b | sam3 (heads need teacher_ckpt)
+    input_size: [256, 256]  # (H, W) frames are resized to this for C-RADIO -> 16 x 16 = 256 patch tokens
+    teacher_ckpt: playground/Pretrained_models/C-RADIOv4-SO400M_pth/c-radio_v4-so400m_half.pth.tar
+    outlier_norm: 100.0     # C-RADIO's fixed top-row artifact tokens (norm ~760) are masked
+    stats_path: playground/Pretrained_models/C-RADIOv4-SO400M/trisystem_stats_carfew_v1_front_256x256_f30.pt
+  tri_system:
+    frame_size: [368, 640]  # (H, W) loader frames (System 2 input); == obs_image_size [W, H]
+    future_offsets: [30]    # == data config video delta_indices[1:] (h1_2_car_left_front_future30)
+    loss_weights: {system15: 0.0, system1: 1.0}
+    eval: {num_samples: 8, system15_steps: 4, system1_steps: 4, seed: 0}
+  system15:                 # Flow Transformer: self-attn over X_tau, cross-attn to Z_t and to S_t, adaLN(tau)
+    target: delta
+    d_model: 768
+    depth: 12
+    num_heads: 12
+    tau_schedule: {schedule: uniform}
+    num_noise_samples: 2    # noise draws per example (cheap: the encoders run once)
+    s2_drop_prob: 0.0       # no S_t dropout (CFG off); > 0 only together with cfg_scale > 1
+    sample_steps: 4         # Euler ODE steps at inference
+    sample_method: euler
+    grad_ckpt: false
+  system1:                  # Action DiT: self-attn over [state, A_tau], cross-attn to dZ, adaLN(tau_a)
+    d_model: 768
+    depth: 12
+    num_heads: 12
+    cond_streams: [dz]      # predicted change only (S_t / Z_t not given to System 1)
+    cond_mode: separate
+    tau_schedule: {schedule: beta, beta_a: 1.5, beta_b: 1.0, beta_s: 0.999}
+    num_noise_samples: 4
+    sample_steps: 4         # Euler ODE steps at inference
+    delta_source: gt        # teacher forcing; stage 3 mixes in System 1.5 samples
+    delta_noise_std: 0.05   # small noise on the GT change (scaled units) against exposure bias
+    delta_drop_prob: 0.1    # learned null change tokens (robustness; "no dZ" ablation at eval)
+  action_model:             # action / state layout (QwenGR00T keys)
+    action_dim: 42          # head(2) + arms(14) + hands(26)
+    state_dim: 42           # head_cmd(2) + arms(14) + hands(26)
+    action_horizon: 30      # 1.0 s at 30 Hz, = the dZ horizon
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /mnt/DATA2/yyg/starVLA/playground/Datasets
+    data_mix: car_few_tasks_v1_front_future30   # [frame t, frame t+30] + state + 30-step action chunk
+    min_episode_length: 150
+    exclude_episodes: [237, 1155]
+    task_text_replace:
+      " (fixed seat)": ""
+    lerobot_version: "v3.0"
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    obs_image_size: [640, 368]   # (W, H) for every frame
+    delete_pause_frame: false
+    video_backend: torchcodec_cuda
+    multiprocessing_context: spawn
+    num_workers: 8
+    prefetch_factor: 4
+    in_order: false
+  val_data:   # fixed validation examples for trainer_eval_hook (main process, CPU decoding)
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /mnt/DATA2/yyg/starVLA/playground/Datasets
+    data_mix: car_few_tasks_v1_val_front_future30
+    task_text_replace:
+      " (fixed seat)": ""
+    lerobot_version: "v3.0"
+    action_mode: abs
+    obs_image_size: [640, 368]
+    video_backend: torchcodec
+
+trainer:
+  pretrained_checkpoint: playground/Checkpoints/starvla_trisystem_s1p5_carfew_v1_front/checkpoints/steps_50000_pytorch_model.pt
+  max_train_steps: 50000
+  num_warmup_steps: 2000
+  save_interval: 10000
+  eval_interval: 1000
+  learning_rate:
+    base: 1.0e-05
+    system1: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr_rate: 0.01
+  freeze_modules: qwen_vl_interface,radio_encoder,system15
+  max_grad_norm: 1.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 0.0

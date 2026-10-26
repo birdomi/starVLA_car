@@ -15,11 +15,7 @@ framework:
     action_dim: 48
     state_dim: 48
     action_horizon: 30
-    # WTA multiple-hypothesis regression
     loss_type: l1
-    num_hypotheses: 8
-    wta_relax: 0.05
-    score_loss_coeff: 1.0
     moe_expert_layers: 0  # 0 = linear branch; >0 = K expert transformer blocks
 
 datasets:

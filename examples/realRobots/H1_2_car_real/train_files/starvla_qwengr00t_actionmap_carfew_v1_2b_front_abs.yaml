@@ -1,0 +1,128 @@
+# ActionMap DiT v3 on car-few-tasks-v1, 100k steps: otherwise identical to starvla_qwengr00t_carfew_v1_2b_front_abs.yaml (Qwen3.5-2B fp32,
+# front camera only, abs actions, same data filters / optimizer / schedule / batch) EXCEPT the action head:
+# QwenGR00T_GridDiT, the chunk tokenized as (30 time rows x 3 body columns) = 90 tokens, left and right columns
+# sharing one encoder/decoder, learned per-cell PE, no RoPE, timestep-only AdaLN, state = 1 leading token,
+# 0 future tokens (the ActionMap v3 recipe of the RoboCasa / RoboTwin runs; the DiT baseline run used 32).
+run_id: starvla_qwengr00t_actionmap_carfew_v1_2b_front_abs
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: ryk9012-gwangju-institute-of-science-and-technology
+wandb_project: starVLA_h1_2_car
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T_GridDiT
+  qwenvl:
+    base_vlm: Qwen/Qwen3.5-2B
+    attn_implementation: flash_attention_2
+    # fp32 master weights. ZeRO-0 (needed by Muon) keeps none, and in bf16 the 1e-5 VLM
+    # updates round away: the leftturn_v2_mix 100k checkpoint (bf16, 0.8B) still has
+    # 74-94% of every sampled VLM matrix bit-identical to the base model.
+    torch_dtype: float32
+  action_model:
+    action_dim: 42   # head(2) + arms(14) + hands(26)
+    state_dim: 42    # head_cmd(2) + arms(14) + hands(26); measured head is not an input
+    action_horizon: 30   # 1.0 s at 30 Hz
+    # --- action grid: 30 rows x 3 columns = 90 tokens ---
+    # action layout: [head 0:2 | L arm 2:9 | L hand 9:22 | R arm 22:29 | R hand 29:42]
+    action_group_indices:
+      - "2:9,9:22"     # left  = left arm  + left hand   (20-D)
+      - "22:29,29:42"  # right = right arm + right hand  (20-D)
+      - "0:2"          # head (2-D), belongs to neither side
+    share_groups: [[0, 1]]   # left and right reuse ONE encoder / decoder
+    group_names: [left, right, head]   # loss/left_l1, loss/right_l1, loss/head_l1
+    time_patch_size: 1
+    # state: whole 42-D state -> one MLP -> one leading sequence token (as in the DiT baseline)
+    state_single: true
+    state_as_kv: false
+    # positional scheme v3: learned per-cell absolute PE (time + column identity), no RoPE, timestep-only AdaLN
+    add_pos_embed: true
+    use_rope: false
+    group_adaln_cond: false
+    num_target_vision_tokens: 0
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /mnt/DATA2/yyg/starVLA/playground/Datasets
+    # head (front_view) camera only; the wrist views are not fed to the VLM
+    data_mix: car_few_tasks_v1_front
+    # Drop aborted recordings (150 frames = 5.0 s; 41 of 2608 train episodes, 0.3% of frames).
+    # Train check 2026-09-29: of the 21 episodes where the task arm barely moves (<30 deg),
+    # 17 are < 5 s. Still-in after this filter and bad on video: ep 237 (wiper 2, dark,
+    # human hand in frame) and ep 1155 (hazard OFF, robot only looks at the ceiling).
+    # NOT a filter criterion: little head motion. 10-15 s turn-signal episodes without the
+    # head turn are valid, quicker demos (checked on video: ep 599, 1707).
+    min_episode_length: 150
+    # Episodes that pass the length filter but are bad on video (train split ids).
+    exclude_episodes: [237, 1155]
+    # Merge the "(fixed seat)" variants into their base instruction (9 -> 6 prompts); the
+    # seat condition will not be given at deployment. Rewritten in the loader only.
+    task_text_replace:
+      " (fixed seat)": ""
+    lerobot_version: "v3.0"
+    # Absolute targets for every group (head, arms, hands): the model predicts joint
+    # angles / grip units directly, with no anchoring on the current state. The state
+    # is still an input (state_dim 42). Earlier runs kept the arms rel because their
+    # residual range is 3-8x narrower than the joint range; this run drops that bias.
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 32   # global batch 128 (32 x 4 GPUs)
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    delete_pause_frame: false
+    video_backend: torchcodec_cuda
+    multiprocessing_context: spawn   # torchcodec_cuda cannot init CUDA in forked workers
+    # 64-core box shared with other jobs (load ~90): 4 workers could not keep up
+    # and the loop stalled 15 s every 4 steps (data_times 15.5 vs model 1.8).
+    # Not disk-bound - iowait is 0 and the 51 GB of video fits in the 1.26 TB
+    # page cache - so the fix is more decode workers, not faster storage.
+    # Front camera only (1 video instead of 3): benchmarked 2026-09-29 on GPUs 0-3, bs32:
+    #   12 workers: 2.62 s/step, 0% steps stalled, 80.5 GB GPU, 32.8 cores
+    #    6 workers: 2.63 s/step, 15% steps stalled >0.5 s, 76.2 GB GPU, 26.1 cores
+    # 6 chosen (each spawn worker holds a ~0.7 GB CUDA context). If the box gets busy
+    # and data_times climbs, go back to 12. Do NOT use fork+decord here: it OOMed the host.
+    num_workers: 6
+    prefetch_factor: 6
+    in_order: false
+
+trainer:
+  # 1.65M frames: 1 epoch ~ 12.9k steps at batch 128, so 100k steps ~ 7.8 epochs, ~3-3.5 days on 4 GPUs.
+  # 100k (not the DiT baseline's 200k): the baseline's val error was flat from 50k to 100k and slightly
+  # worse at 150k. Note the cosine now ends at 100k, so this run's 100k is fully annealed while the
+  # baseline's 100k checkpoint was taken mid-schedule.
+  # Checkpoints every 5k so the best one can be picked after the fact.
+  max_train_steps: 100000
+  num_warmup_steps: 2000
+  save_interval: 50000   # fp32 2B checkpoint ~11 GB each
+  eval_interval: 500
+  learning_rate:
+    base: 1.0e-05
+    action_model: 1.0e-04
+  # Repo default: linear warmup 0-2k, then cosine down to min_lr over the whole run.
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+
+  # Muon on the action head's 2D matrices only; the VLM stays on plain AdamW.
+  # REQUIRES ZeRO stage 0 (launch with ACCELERATE_DEEPSPEED_ZERO_STAGE=0).
+  optimizer:
+    name: Muon
+    muon_modules: [action_model]
+    muon_lr: 1.0e-04
+    muon_weight_decay: 1.0e-05
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-05

@@ -63,8 +63,40 @@ class EgoDexHumanDataConfig:
         )
 
 
+class EgoDexHumanPastFutureDataConfig(EgoDexHumanDataConfig):
+    """Bidirectional action window: H slots = H/2 PAST steps a[t-H/2..t-1]
+    followed by H/2 FUTURE steps a[t..t+H/2-1]. action_mode delta is
+    bidirectional (anchored at t: past slots are backward one-step diffs).
+    """
+
+    def __init__(self, window: int):
+        assert window % 2 == 0, "window must be even (half past, half future)"
+        self.window = window
+        self.action_indices = list(range(-window // 2, window // 2))
+
+
+class EgoDexHumanHistFrameDataConfig(EgoDexHumanDataConfig):
+    """Current frame plus past reference frame(s): the video window is
+    e.g. [-15, 0] (0.5 s ago and now at 30 fps). State / language stay at t
+    and the action window is unchanged. Before the episode start the past
+    slot is padded with the first frame, so the "past" image equals the
+    current one there (no motion cue, which is the truth).
+    """
+
+    def __init__(self, past_frames=(-15,)):
+        self.video_indices = sorted(set(int(p) for p in past_frames) | {0})
+
+    def modality_config(self):
+        cfg = super().modality_config()
+        cfg["video"] = ModalityConfig(delta_indices=self.video_indices, modality_keys=self.video_keys)
+        return cfg
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     "egodex_human": EgoDexHumanDataConfig(),
+    **{f"egodex_human_pf{h}": EgoDexHumanPastFutureDataConfig(h) for h in (8, 16, 32, 64)},
+    # current frame + frame t-15 (0.5 s ago) as a past reference image
+    "egodex_human_hf15": EgoDexHumanHistFrameDataConfig((-15,)),
 }
 
 DATASET_NAMED_MIXTURES = {
@@ -99,5 +131,31 @@ DATASET_NAMED_MIXTURES = {
         ("egodex_lerobot_part5_epsplit", 15.60, "egodex_human"),
         ("egodex_lerobot_extra_epsplit", 10.47, "egodex_human"),
         ("trex_lerobot_epsplit", 5.47, "egodex_human"),
+    ],
+    # part1 + TRex only (per-episode files), weights proportional to frame counts:
+    # 15.35M + 5.47M = 20.8M samples -> 50K steps @ global batch 512 = 1.23 epochs.
+    "egodex_part1_trex_epsplit": [
+        ("egodex_lerobot_part1_epsplit", 15.35, "egodex_human"),
+        ("trex_lerobot_epsplit", 5.47, "egodex_human"),
+    ],
+    "egodex_part1_epsplit": [("egodex_lerobot_part1_epsplit", 1.0, "egodex_human")],
+    # held-out test set (per-episode files) for evaluation, both window layouts
+    "egodex_test_epsplit": [("egodex_lerobot_test_epsplit", 1.0, "egodex_human")],
+    "egodex_test_pf64_epsplit": [("egodex_lerobot_test_epsplit", 1.0, "egodex_human_pf64")],
+    # part1 only with a past+future action window of H steps (half/half).
+    **{f"egodex_part1_pf{h}": [("egodex_lerobot_part1_epsplit", 1.0, f"egodex_human_pf{h}")] for h in (8, 16, 32, 64)},
+    # two-frame input (t-15, t): train on part1, evaluate on the held-out test set
+    "egodex_part1_hf15": [("egodex_lerobot_part1_epsplit", 1.0, "egodex_human_hf15")],
+    "egodex_test_hf15": [("egodex_lerobot_test_epsplit", 1.0, "egodex_human_hf15")],
+    # two-frame input on the full EgoDex train split + TRex (weights = frame counts in millions,
+    # same as egodex_full_trex_epsplit): 4.5x the data of part1 for VLM-unfrozen runs.
+    "egodex_full_trex_hf15": [
+        ("egodex_lerobot_part1_epsplit", 15.35, "egodex_human_hf15"),
+        ("egodex_lerobot_part2_epsplit", 15.65, "egodex_human_hf15"),
+        ("egodex_lerobot_part3_epsplit", 15.74, "egodex_human_hf15"),
+        ("egodex_lerobot_part4_epsplit", 15.94, "egodex_human_hf15"),
+        ("egodex_lerobot_part5_epsplit", 15.60, "egodex_human_hf15"),
+        ("egodex_lerobot_extra_epsplit", 10.47, "egodex_human_hf15"),
+        ("trex_lerobot_epsplit", 5.47, "egodex_human_hf15"),
     ],
 }

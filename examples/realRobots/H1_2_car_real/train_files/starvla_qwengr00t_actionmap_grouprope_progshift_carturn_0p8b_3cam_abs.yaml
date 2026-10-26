@@ -1,0 +1,138 @@
+# Temporal progress-conditioned AdaLN SHIFT on top of the frozen grouprope ActionMap DiT (0.8B, 3 cams, abs).
+# Everything from the pretrained checkpoint is FROZEN (VLM, DiT, AdaLN modulation, encoders/decoders, group
+# embedding). Trainable: progress_encoder (prev/curr VLM hidden states -> temporal cross-attn -> delta pools ->
+# 256-D progress vector) and, in every DiT block, a shift-only AdaLayerNorm as the FFN pre-norm conditioned on
+# that vector: FFN input = LN(x) + Linear(SiLU(z)) (bias-free, zero-init; scale fixed at 1).
+# Each camera is fed at t-30 and t; the DiT still cross-attends to frame t only.
+# Aux: a linear head on the encoder's pooled 768-D feature regresses t / T_episode (MSE x 0.1, added to the action loss).
+run_id: starvla_qwengr00t_actionmap_grouprope_progshift_carturn_0p8b_3cam_abs
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: ryk9012-gwangju-institute-of-science-and-technology
+wandb_project: starVLA_h1_2_car
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T_GridDiT_ProgressShift
+  progress_shift:
+    num_cameras: 3        # = len(video_keys); images arrive as [prev, curr] per camera
+    prev_offset: 30       # frames (1.0 s); = data config video_indices [-30, 0]
+    d_model: 256          # progress-branch projection width
+    num_heads: 4          # temporal cross-attention heads
+    progress_loss_weight: 0.1   # aux MSE: linear head on the 768-D pooled feature -> t / T_episode
+  qwenvl:
+    base_vlm: Qwen/Qwen3.5-0.8B
+    attn_implementation: flash_attention_2
+    # fp32 weights. ZeRO-0 (as launched) keeps no fp32 master copy, and in bf16 the 1e-5 VLM
+    # updates round away: the leftturn_v2_mix 100k checkpoint (bf16, 0.8B) still has
+    # 74-94% of every sampled VLM matrix bit-identical to the base model.
+    torch_dtype: float32
+  action_model:
+    action_dim: 42   # head(2) + arms(14) + hands(26)
+    state_dim: 42    # head_cmd(2) + arms(14) + hands(26); measured head is not an input
+    action_horizon: 32   # 1.07 s at 30 Hz; = data config h1_2_car_turn_3cam action_indices
+    # --- action grid: 32 time rows x 3 columns = 96 tokens ---
+    # action layout: [head 0:2 | L arm 2:9 | L hand 9:22 | R arm 22:29 | R hand 29:42]
+    action_group_indices:
+      - "0:2"          # head  (2-D)
+      - "2:9,22:29"    # arms  = left arm + right arm   (14-D)
+      - "9:22,29:42"   # hands = left hand + right hand (26-D)
+    share_groups: []   # every column has its own encoder / decoder
+    group_names: [head, arms, hands]   # loss/head_l1, loss/arms_l1, loss/hands_l1
+    time_patch_size: 1
+    # state: whole 42-D state -> one MLP -> one leading sequence token (as in the DiT baseline)
+    state_single: true
+    state_as_kv: false
+    # positions: body identity = learnable per-column group embedding added to the tokens; time = temporal
+    # RoPE (1-axis, row index) on q/k; no per-cell learned PE; no AdaLN group conditioning
+    add_pos_embed: false
+    add_group_embed: true
+    use_rope: true
+    rope_axes: time
+    group_adaln_cond: false
+    num_target_vision_tokens: 0
+    diffusion_model_cfg:
+      ffn_progress_shift_dim: 256   # progress vector width; every block's FFN pre-norm -> progress AdaLayerNorm
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /mnt/DATA2/yyg/starVLA/playground/Datasets
+    # head_left_2 (= the old front_view) + wrist_left_2 + wrist_right_2, in that order; per-episode GOP-15
+    # re-export of car-turn-signal (the concatenated originals are partly undecodable, see data_config.py)
+    data_mix: car_turn_signal_ep_3cam_prev30   # each camera at t-30 and t
+    emit_progress: true   # sample["progress"] = t / (T_episode - 1), target of the progress head
+    # car-turn-signal has no episode < 20 s and none with a still task arm; the filter is a no-op guard
+    min_episode_length: 150
+    # train episodes whose original video segment did not decode (scan_video_episodes.py); no mp4 was made for them
+    exclude_episodes: [15, 16, 69, 70, 71, 339, 340, 351, 352, 361, 362, 390, 391, 584, 585, 610, 611, 654, 655, 661, 662, 742, 743, 807, 808, 817, 818, 951, 952, 1033, 1034, 1045, 1046, 1049, 1050, 1125, 1126]
+    # Merge the "(fixed seat)" variants into their base instruction (9 -> 6 prompts); the
+    # seat condition will not be given at deployment. Rewritten in the loader only.
+    task_text_replace:
+      " (fixed seat)": ""
+    lerobot_version: "v3.0"
+    # Absolute targets for every group (head, arms, hands): the model predicts joint
+    # angles / grip units directly, with no anchoring on the current state. The state
+    # is still an input (state_dim 42). Earlier runs kept the arms rel because their
+    # residual range is 3-8x narrower than the joint range; this run drops that bias.
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 32   # global batch 128 (32 x 4 GPUs)
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    delete_pause_frame: false
+    video_backend: torchcodec_cuda
+    multiprocessing_context: spawn   # torchcodec_cuda cannot init CUDA in forked workers
+    # 64-core box shared with other jobs (load ~90): 4 workers could not keep up
+    # and the loop stalled 15 s every 4 steps (data_times 15.5 vs model 1.8).
+    # Not disk-bound - iowait is 0 and the 51 GB of video fits in the 1.26 TB
+    # page cache - so the fix is more decode workers, not faster storage.
+    # Front camera only (1 video instead of 3): benchmarked 2026-09-29 on GPUs 0-3, bs32:
+    #   12 workers: 2.62 s/step, 0% steps stalled, 80.5 GB GPU, 32.8 cores
+    #    6 workers: 2.63 s/step, 15% steps stalled >0.5 s, 76.2 GB GPU, 26.1 cores
+    # 6 chosen (each spawn worker holds a ~0.7 GB CUDA context). If the box gets busy
+    # and data_times climbs, go back to 12. Do NOT use fork+decord here: it OOMed the host.
+    # 12 workers x 4 ranks used ~24 cores with zero data wait and pushed the shared box to load 133
+    # (GPU util 10-27%, 9 s/step); 6 is enough for 3 videos at this step time.
+    num_workers: 6
+    # Keep each worker's parquet files in memory and slice episodes (was a full re-read + filter of a
+    # multi-episode v3 file per sample: ~470 of ~900 ms CPU). Pair with STARVLA_CUDA_DECODER_CACHE=150 in
+    # the launch env... capped at 150 per worker: one GPU fits only ~1100 NVDEC decoders across ALL processes
+    # (6 workers x 400 crashed with "Failed to create NVDEC decoder: 2"); 6 x 150 = 900. Measured with all open:
+    # 897 -> 89 ms CPU per sample.
+    cache_parquet_tables: true
+    prefetch_factor: 6
+    in_order: false
+
+trainer:
+  # frozen grouprope ActionMap DiT 100k (all its weights load; the new progress modules keep their init)
+  pretrained_checkpoint: /mnt/DATA2/yyg/starVLA/playground/Checkpoints/starvla_qwengr00t_actionmap_grouprope_carturn_0p8b_3cam_abs/checkpoints/steps_100000_pytorch_model.pt
+  # only the new modules have requires_grad (the framework freezes the rest; frozen params are kept out of the optimizer)
+  max_train_steps: 30000
+  num_warmup_steps: 1000
+  save_interval: 10000
+  eval_interval: 500
+  learning_rate:
+    base: 1.0e-04
+    progress_encoder: 1.0e-04   # FFN progress AdaLN Linears (inside action_model) use base
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: false   # VLM runs under no_grad; nothing to checkpoint
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-05
