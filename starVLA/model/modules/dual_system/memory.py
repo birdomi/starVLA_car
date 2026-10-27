@@ -10,7 +10,11 @@ progress t / (T - 1) classified into num_bins equal bins from the mean-pooled me
 through an MLP into the progress token.
 
 attention: "standard" (nn.MultiheadAttention) or "gated" (GatedAttention: a sigmoid output gate on every head
-channel, computed from the memory tokens, as in the full-attention layers of Qwen3-Next / Qwen3.5)."""
+channel, computed from the memory tokens, as in the full-attention layers of Qwen3-Next / Qwen3.5).
+
+token_dim: an MLP (token_resize) first maps every VLM token from vlm_dim to token_dim, and the rest of the memory works on
+token_dim tokens, so VLMs of different hidden sizes (Qwen3.5-2B 2048, -4B 2560) share one memory architecture; the
+readout width ctx_dim is then usually token_dim as well."""
 from typing import Optional, Tuple
 
 import torch
@@ -72,13 +76,19 @@ class MemoryBlock(nn.Module):
 
 class EpisodeMemory(nn.Module):
     def __init__(self, vlm_dim: int, ctx_dim: int, num_tokens: int = 16, d_model: int = 768, depth: int = 2,
-                 num_heads: int = 12, mlp_ratio: float = 4.0, progress_bins: int = 50, attention: str = "standard"):
+                 num_heads: int = 12, mlp_ratio: float = 4.0, progress_bins: int = 50, attention: str = "standard",
+                 token_dim: Optional[int] = None):
         super().__init__()
         if attention not in _ATTENTIONS:
             raise ValueError(f"EpisodeMemory: attention must be one of {_ATTENTIONS}, got {attention!r}")
         self.attention = attention
         self.num_tokens, self.d_model, self.num_bins = int(num_tokens), int(d_model), int(progress_bins)
         self.init_tokens = nn.Parameter(torch.randn(1, self.num_tokens, self.d_model) * 0.02)
+        self.token_resize = None
+        if token_dim:
+            self.token_resize = nn.Sequential(nn.LayerNorm(vlm_dim), nn.Linear(vlm_dim, int(token_dim)),
+                                              nn.GELU(approximate="tanh"), nn.Linear(int(token_dim), int(token_dim)))
+            vlm_dim = int(token_dim)
         self.in_proj = nn.Sequential(nn.LayerNorm(vlm_dim), nn.Linear(vlm_dim, self.d_model))
         self.blocks = nn.ModuleList([MemoryBlock(self.d_model, int(num_heads), float(mlp_ratio), attention)
                                      for _ in range(int(depth))])
@@ -103,6 +113,8 @@ class EpisodeMemory(nn.Module):
     def update(self, m: torch.Tensor, vlm_tokens: torch.Tensor, vlm_mask: torch.Tensor,
                valid: Optional[torch.Tensor] = None) -> torch.Tensor:
         """One step M_t = f(M_{t-1}, H_t). valid [B] bool: samples whose frame lies outside the episode keep M_{t-1}."""
+        if self.token_resize is not None:
+            vlm_tokens = self.token_resize(vlm_tokens.to(self.token_resize[1].weight.dtype))
         x = self.in_proj(vlm_tokens.to(self.in_proj[1].weight.dtype))
         new = m
         for blk in self.blocks:

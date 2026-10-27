@@ -2483,6 +2483,9 @@ class LeRobotMixtureDataset(Dataset):
                 # random_phase: every episode starts at a random frame in [0, stride) instead of frame 0, so the walked
                 # grid covers all frames over the passes (False = the grid 0, stride, 2 stride, ... of every episode)
                 "random_phase": bool(st.get("random_phase", False)),
+                # jitter: every update interval is drawn uniformly from [stride - jitter, stride + jitter] frames
+                # instead of exactly `stride` (0 = the fixed grid)
+                "jitter": int(st.get("jitter", 0)),
                 "batch": int(self.data_cfg.get("per_device_batch_size", 1)),
                 "world": int(os.environ.get("WORLD_SIZE", "1")),
             }
@@ -2623,7 +2626,8 @@ class LeRobotMixtureDataset(Dataset):
     
 
     def _stream_episode(self, slot: int, j: int) -> tuple:
-        """The j-th episode of stream `slot` -> (dataset index, trajectory index, grid steps, first step, phase)."""
+        """The j-th episode of stream `slot` -> (dataset index, trajectory index, grid steps, first step, frames = the
+        episode frame of every grid step)."""
         stride = self._stream["stride"]
         rng = np.random.default_rng(safe_hash(("stream", self.seed, slot, j)))
         di = int(rng.choice(len(self.datasets), p=self.dataset_sampling_weights))
@@ -2636,18 +2640,28 @@ class LeRobotMixtureDataset(Dataset):
             phase = int(rng.integers(min(stride, length)))
             n = (length - 1 - phase) // stride + 1
             first = min(first, n - 1)
-        return di, ti, n, first, phase
+        frames = phase + stride * np.arange(n)
+        jitter = self._stream.get("jitter", 0)
+        if jitter:  # drawn last: the draws above are unchanged
+            if not 0 <= jitter < stride:
+                raise ValueError(f"datasets.vla_data.stream.jitter must be in [0, stride), got {jitter} (stride {stride})")
+            gaps = stride + rng.integers(-jitter, jitter + 1, size=length // (stride - jitter) + 1)
+            frames = np.concatenate([[phase], phase + np.cumsum(gaps)])
+            frames = frames[frames < length]
+            n = len(frames)
+            first = min(first, n - 1)
+        return di, ti, n, first, frames
 
     def _stream_locate(self, slot: int, k: int) -> tuple:
         """Step k of stream `slot` -> (episode counter j, dataset index, trajectory index, grid steps, step in episode,
-        phase = frame of grid step 0)."""
-        eps = self._stream_cache.setdefault(slot, [])  # [(first stream step, di, ti, n, first episode step, phase)]
+        frames = the episode frame of every grid step)."""
+        eps = self._stream_cache.setdefault(slot, [])  # [(first stream step, di, ti, n, first episode step, frames)]
         while not eps or eps[-1][0] + eps[-1][3] - eps[-1][4] <= k:
             start = eps[-1][0] + eps[-1][3] - eps[-1][4] if eps else 0
             eps.append((start, *self._stream_episode(slot, len(eps))))
         j = int(np.searchsorted([e[0] for e in eps], k, side="right")) - 1
-        start, di, ti, n, first, phase = eps[j]
-        return j, di, ti, n, first + k - start, phase
+        start, di, ti, n, first, frames = eps[j]
+        return j, di, ti, n, first + k - start, frames
 
     def _stream_item(self, index: int) -> dict:
         """Streaming sample. The loader's sequential batches of B (= per_device_batch_size) are dealt round-robin to the
@@ -2658,10 +2672,10 @@ class LeRobotMixtureDataset(Dataset):
         episode counter, step in the episode, grid steps of the episode]."""
         sw = self._stream
         slot, k = index % (sw["world"] * sw["batch"]), index // (sw["world"] * sw["batch"])
-        j, di, ti, n, es, phase = self._stream_locate(slot, k)
+        j, di, ti, n, es, frames = self._stream_locate(slot, k)
         dataset = self.datasets[di]
         trajectory_id = dataset.trajectory_ids[ti]
-        base = phase + es * sw["stride"]
+        base = int(frames[es])
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(safe_hash(("stream_aug", self.seed, slot, j)) % (2 ** 63))
             raw_data = dataset.get_step_data(trajectory_id, base)

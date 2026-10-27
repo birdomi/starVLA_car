@@ -16,6 +16,9 @@ layers), read by the action DiT.
     memory keys missing) predicts exactly as before until training moves it.
   * Progress: t / (T - 1) classified into progress_bins bins from the memory, cross-entropy x progress_loss_weight
     (datasets.vla_data.emit_progress: true).
+  * token_dim (optional): an MLP resizes every VLM token to token_dim before the memory (EpisodeMemory.token_resize), and
+    the readout / the DiT's memory cross-attention use token_dim too (memory_dim: token_dim), so the memory path is the
+    same architecture for any VLM size (Qwen3.5-2B 2048, -4B 2560). Unset: memory_dim = the VLM hidden size.
 
 Two training modes:
   * window (default): the memory is rebuilt from its initial state over the K frames of every sample.
@@ -58,6 +61,7 @@ _DEFAULTS = {
     "attention": "gated",
     "past_grad": False,
     "stream": None,
+    "token_dim": None,
 }
 
 
@@ -72,10 +76,12 @@ class Qwen_GR00T_EpisodeMemory(Qwen_GR00T):
             raise ValueError(f"episode_memory.update_offsets must be ascending and end at 0 (the current frame), "
                              f"got {self.offsets}")
         vl_dim = int(self.qwen_vl_interface.model.config.hidden_size)
+        token_dim = int(mc["token_dim"]) if mc["token_dim"] else None
+        ctx_dim = token_dim or vl_dim
         dit = fw.action_model.diffusion_model_cfg
-        if not dit.get("memory_cond", False) or int(dit.get("memory_dim", 0) or 0) != vl_dim:
+        if not dit.get("memory_cond", False) or int(dit.get("memory_dim", 0) or 0) != ctx_dim:
             raise ValueError("QwenGR00T_EpisodeMemory needs framework.action_model.diffusion_model_cfg.memory_cond: true "
-                             f"and memory_dim: {vl_dim} (the VLM hidden size)")
+                             f"and memory_dim: {ctx_dim} (episode_memory.token_dim, else the VLM hidden size)")
         self.num_views = int(fw.get("num_views", 0) or 0)  # 0 = infer from the image count
         self.progress_weight = float(mc["progress_loss_weight"])
         self.past_grad = bool(mc["past_grad"])
@@ -89,7 +95,7 @@ class Qwen_GR00T_EpisodeMemory(Qwen_GR00T):
                 raise ValueError(f"episode_memory.stream.tbptt must be >= 1, got {self.mem_tbptt}")
         self._mem_streams = {}  # stream slot -> carried memory state (training, stream mode)
         self.episode_memory = EpisodeMemory(
-            vl_dim, vl_dim, num_tokens=int(mc["num_tokens"]), d_model=int(mc["d_model"]), depth=int(mc["depth"]),
+            vl_dim, ctx_dim, token_dim=token_dim, num_tokens=int(mc["num_tokens"]), d_model=int(mc["d_model"]), depth=int(mc["depth"]),
             num_heads=int(mc["num_heads"]), mlp_ratio=float(mc["mlp_ratio"]), progress_bins=int(mc["progress_bins"]),
             attention=str(mc["attention"]))
 
