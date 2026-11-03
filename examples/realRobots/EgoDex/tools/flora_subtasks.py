@@ -89,6 +89,57 @@ def setup(tempseg: Path, base: Path, captioner: Path):
     return pipeline, media, CachedSession
 
 
+def seeking_decode(media):
+    """media.decode_selected that seeks to the keyframe before the first wanted frame instead of decoding from frame 0.
+    Flora decodes per TempSeg window and, with three cameras, per caption segment and camera, each time from the first
+    frame: O(segments x length) frames per episode, the bottleneck of a three-camera run (one 80 s AgiBot episode,
+    ~40k frames decoded under the GIL). Frames are matched to their index by the probed timestamps and converted as
+    the original does; anything unexpected (a seek past the first wanted frame, a timestamp not in the probe, a frame
+    left over) falls back to the original."""
+    import bisect
+    from fractions import Fraction
+
+    import av
+
+    orig = media.decode_selected
+
+    def decode_selected(video, wanted, canonical=False):
+        wanted = set(wanted)
+        if not wanted or min(wanted) < 0 or max(wanted) >= len(video.pts_us) or min(wanted) < 120:
+            return orig(video, wanted, canonical)  # invalid (orig raises), or near the start: nothing to skip
+        lo, hi, result = min(wanted), max(wanted), {}
+        with av.open(str(video.path), options={"err_detect": "explode"}) as container:
+            stream = container.streams.video[0]
+            stream.codec_context.thread_count = 1
+            zero = None
+            for frame in container.decode(stream):  # the first frame's pts: the origin of video.pts_us
+                zero = frame.pts
+                break
+            container.seek(zero + int(Fraction(video.pts_us[lo], 1000000) / stream.time_base), stream=stream,
+                           backward=True, any_frame=False)
+            first = True
+            for frame in container.decode(stream):
+                t = Fraction(frame.pts - zero) * stream.time_base * 1000000
+                i = bisect.bisect_left(video.pts_us, t)
+                if i >= len(video.pts_us) or video.pts_us[i] != t or (first and i > lo):
+                    return orig(video, wanted, canonical)
+                first = False
+                if i in wanted:
+                    use_canonical = (canonical and frame.format.name == "yuv420p" and frame.width % 16 == 0
+                                     and frame.height % 2 == 0 and int(frame.colorspace) in (2, 5, 6)
+                                     and int(frame.color_range) in (0, 1))
+                    if use_canonical:
+                        from canonical_rgb import canonical_rgb
+                        result[i] = canonical_rgb(frame)
+                    else:
+                        result[i] = frame.to_image().convert("RGB")
+                if i >= hi:
+                    break
+        return result if set(result) == wanted else orig(video, wanted, canonical)
+
+    media.decode_selected = decode_selected  # frames_for() looks it up in media's globals
+
+
 class Videos:
     """Episode mp4 by its frames-index path, from <raw_root>/<split>/ or <raw_root>/<split>.zip."""
 
@@ -215,6 +266,8 @@ def main():
     ap.add_argument("--captioner", type=Path, default=PM / "Flora-Captioner")
     ap.add_argument("--captioner-bf16", type=Path, default=PM / "Flora-Captioner-bf16")
     ap.add_argument("--tmp", default="/dev/shm")
+    ap.add_argument("--decode-from-start", action="store_true",
+                    help="Flora's own frame decoding (from frame 0 on every call) instead of seeking to a keyframe")
     ap.add_argument("--profile", choices=["human", "dex", "tianji"], default="human",
                     help="Flora action profile; dex / tianji need the index's left_wrist / right_wrist videos")
     ap.add_argument("--max-duration-s", type=float, default=0.0,
@@ -249,6 +302,8 @@ def main():
         return
 
     pipeline, media, CachedSession = setup(a.tempseg.resolve(), a.base.resolve(), a.captioner.resolve())
+    if not a.decode_from_start:
+        seeking_decode(media)
     if a.max_duration_s:  # media.py imported these names from config: patch them where probe() reads them
         media.MAX_DURATION_S, media.MAX_FRAME_COUNT = a.max_duration_s, int(a.max_duration_s * 60)
     videos = {}  # split -> Videos, for rows without their own video paths
@@ -357,10 +412,12 @@ def main():
         r = dict(seg_rows.get(e["path"], {"error": "missing"}))
         dur = float(r.get("duration", (int(e["n"]) - 1) / float(e["fps"])))
         raw = []
-        # up to 64 frames per caption (BEFORE / TARGET / AFTER), RGB of every camera (index "frame_bytes"; else 1080p
-        # ~6.3 MB), twice for a three-view mosaic
+        # decoded RGB per frame of every camera (index "frame_bytes"; else 1080p ~6.3 MB), twice for a three-view
+        # mosaic; the single-view captioner decodes the frames of all its caption blocks (up to 64 per caption) at once,
+        # the three-view one one caption at a time (its BEFORE / TARGET / AFTER blocks, bounded here by 192 frames)
         fb = float(e.get("frame_bytes") or 6.3e6) * (2 if three else 1)
-        need = min(64 * len(r.get("segments") or []), int(dur * float(e.get("fps", 30))) + 1) * fb
+        frames = 192 if three else 64 * len(r.get("segments") or [])
+        need = min(frames, int(dur * float(e.get("fps", 30))) + 1) * fb
         held = budget.take(need) if budget is not None and r.get("segments") else 0.0
         try:
             return _caption(e, r, dur, raw)
