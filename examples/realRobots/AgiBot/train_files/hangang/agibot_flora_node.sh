@@ -20,8 +20,8 @@ export HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false VLLM_WORKER_MULTIPROC_METHO
 mkdir -p ${F}/logs ${OUT}
 echo "[$(date)] node ${NODE}/${NN} $(hostname): flora dex"
 for g in 0 1 2 3; do
+  shard=$((NODE * 4 + g)); tag=s${shard}of$((NN * 4))  # outside the subshell: the log name below needs it
   (
-    shard=$((NODE * 4 + g)); tag=s${shard}of$((NN * 4))
     for attempt in $(seq 1 ${RETRIES}); do
       ok=1
       for stage in tempseg caption; do
