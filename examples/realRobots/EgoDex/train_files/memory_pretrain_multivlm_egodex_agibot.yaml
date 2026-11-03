@@ -1,0 +1,95 @@
+# Multi-VLM episode-memory pretraining on EgoDex + AgiBot World 2026 (starVLA/training/train_memory_pretrain.py), no
+# action head; as memory_pretrain_multivlm_egodex.yaml (from scratch), with a second source:
+#  * AgiBot (examples/realRobots/AgiBot/): top_head 448x256 + both hand cameras 312x256 at 10 fps (agibot_frames.py),
+#    the three as separate images per update to every VLM (EgoDex: its one camera); Flora dex subtasks with ordinals on
+#    repeated texts (agibot_subtasks.py ordinals); 95% train / 5% held out by path hash
+#  * 5 VLMs: Qwen3.5-2B, Qwen3-VL-4B, Gemma4-E2B, MiniCPM-V-4.6, Molmo2-4B
+#  * new episodes are drawn uniformly over both sources, so each contributes by duration (EgoDex ~830 h, AgiBot ~580 h)
+#  * 7 frozen VLMs encode the same frames every step; per-VLM token_resize (H -> 1024), one shared memory transformer
+#    (32 tokens, depth 8, d_model 768, gated attention) = the n32d8_t1024 car memory, so steps_<k>_memory_<vlm>.pt loads
+#    into QwenGR00T_EpisodeMemory (episode_memory.init_from) for any of them
+#  * streams: every slot walks whole episodes from frame 0, one update per 1 s +- 0.3 s (10 fps frames, stride 10 +- 3);
+#    truncated BPTT over the last 8 updates
+#  * losses, from a Joint Decision Transformer (4 learned queries: current subtask / finished subtasks / episode
+#    progress / subtask progress; 2 pre-LN blocks of cross-attention over the memory tokens M_t only, self-attention,
+#    FFN): the subtask
+#    in progress among the episode's annotated subtasks (frozen-T5 candidates, cosine / temperature, CE), the finished
+#    ones (same candidates, BCE), episode progress and progress within the current subtask (20 bins, CE)
+#  * subtasks: Flora (TempSeg -> Captioner, task description as instruction) through flora_subtasks.py --backend vllm
+# Data: examples/realRobots/EgoDex/tools/egodex_frames.py (10 fps, 448x256) -> /scratch/t509a04/data/EgoDex/frames448
+# Launch: examples/realRobots/EgoDex/train_files/hangang/train_memory_pretrain.sbatch <this yaml>
+run_id: memory_pretrain_multivlm_n32d8_t1024_egodex_agibot
+run_root_dir: playground/Checkpoints
+wandb_entity: ryk9012-gwangju-institute-of-science-and-technology
+wandb_project: starVLA_memory_pretrain
+seed: 42
+
+vlms:   # name: used in logs and the export file names (5 VLMs here: the EgoDex run's 7 without Qwen3.5-0.8B / 4B)
+  - {name: qwen35_2b, path: playground/Pretrained_models/Qwen3.5-2B, attn_implementation: flash_attention_2, pad_to_multiple_of: 64}
+  - {name: qwen3vl_4b, path: playground/Pretrained_models/Qwen3-VL-4B-Instruct, attn_implementation: flash_attention_2}
+  - {name: gemma4_e2b, path: playground/Pretrained_models/gemma-4-E2B-it, attn_implementation: sdpa}
+  - {name: minicpmv46, path: playground/Pretrained_models/MiniCPM-V-4.6, attn_implementation: flash_attention_2}  # sdpa: its vision attention runs window by window, ~1 s / step
+  - {name: molmo2_4b, path: playground/Pretrained_models/Molmo2-4B, attn_implementation: sdpa}
+
+memory:
+  token_dim: 1024
+  num_tokens: 32
+  d_model: 768
+  depth: 8
+  num_heads: 12
+  mlp_ratio: 4.0
+  attention: gated
+  progress_bins: 50     # the memory's own readout head (not trained here; kept for the action model's layout)
+  tbptt: 8
+
+decision:               # Joint Decision Transformer (memory_pretrain.py JointDecisionTransformer)
+  num_layers: 2
+  num_heads: 12
+  mlp_ratio: 4.0
+  progress_bins: 20
+  subtask_temperature: 0.07
+
+t5:                     # frozen encoder of the subtask candidate sentences (masked mean of the last hidden state)
+  path: playground/Pretrained_models/flan-t5-base
+  cache_size: 50000
+
+loss:
+  subtask: 1.0            # current subtask (candidate CE)
+  subtask_done: 1.0       # finished subtasks (candidate BCE)
+  progress: 1.0           # episode progress (20 bins)
+  subtask_progress: 1.0   # progress within the current subtask (20 bins)
+
+data:
+  sources:
+    - {name: egodex, root: /scratch/t509a04/data/EgoDex/frames448, splits: [part1, part2, part3, part4, part5, extra],
+       subtasks_dir: /scratch/t509a04/data/EgoDex/subtasks_flora}
+    - {name: agibot, root: /scratch/t509a04/data/AgiBotWorld2026/frames448, splits: [agibot_train],
+       subtasks_dir: /scratch/t509a04/data/AgiBotWorld2026/flora/subtasks_flora_dex_ord,
+       cameras: [main, left_wrist, right_wrist]}
+  stride: 10            # frames of the stored 10 fps -> 1 s per update
+  jitter: 3
+  per_device_batch_size: 16
+  num_workers: 8
+
+eval:                   # held-out streams after every save (train_memory_pretrain.evaluate), metrics per source
+  batch_size: 16
+  max_updates: 60       # the first 60 updates (~60 s) of an episode (per source below)
+  sources:
+    - {name: egodex, root: /scratch/t509a04/data/EgoDex/frames448, splits: [test],
+       subtasks_dir: /scratch/t509a04/data/EgoDex/subtasks_flora, max_episodes: 512, max_updates: 60}
+    - {name: agibot, root: /scratch/t509a04/data/AgiBotWorld2026/frames448, splits: [agibot_test],
+       subtasks_dir: /scratch/t509a04/data/AgiBotWorld2026/flora/subtasks_flora_dex_ord,
+       cameras: [main, left_wrist, right_wrist], max_episodes: 256, max_updates: 180}
+
+trainer:
+  max_steps: 100000
+  warmup_steps: 2000
+  lr: 3.0e-4
+  min_lr_rate: 0.05
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  grad_clip: 1.0
+  log_every: 20
+  save_every: 10000       # kept checkpoints (+ eval)
+  resume_every: 1000      # rolling latest.pt (overwritten) to resume from after a crash
+  resume: true

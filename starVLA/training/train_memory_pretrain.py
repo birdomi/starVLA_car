@@ -33,7 +33,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 
-from starVLA.dataloader.egodex_stream import EgoDexFrames, build_stream_loader, load_index, load_subtasks
+from starVLA.dataloader.egodex_stream import EgoDexFrames, build_stream_loader, load_index, load_sources, load_subtasks
 from starVLA.model.modules.dual_system.memory_pretrain import (FrozenT5Encoder, MultiVLMMemory, done_loss,
                                                                progress_bin_targets, progress_loss, subtask_loss)
 from starVLA.model.modules.vlm import get_vlm_model
@@ -55,19 +55,53 @@ def masked_mean(h, mask):
     return (h * m).sum(-2) / m.sum(-2).clamp_min(1)
 
 
+def image_groups(images) -> list:
+    """Sample indices grouped by their image count (one VLM call per group: a batch mixes one-camera and three-camera
+    sources, and not every interface takes a ragged image count)."""
+    by = {}
+    for i, ims in enumerate(images):
+        by.setdefault(len(ims), []).append(i)
+    return [by[k] for k in sorted(by)]
+
+
+def as_image_lists(images) -> list:
+    return [list(x) if isinstance(x, (list, tuple)) else [x] for x in images]
+
+
+def ex_images(ex) -> list:
+    """A sample's camera images (egodex_stream "images"; older batches: the one "image")."""
+    return ex["images"] if "images" in ex else [ex["image"]]
+
+
 @torch.no_grad()
 def vlm_frames(iface, images, langs, inputs=None):
-    """Frozen VLM on one frame per sample -> (last hidden state [B, L, H], mask [B, L]). `inputs`: the processor's output
-    made beforehand (on the CPU, by a dataloader worker: CpuInputs), else built here."""
+    """Frozen VLM on each sample's frame(s) (one image, or a list: the source's cameras) -> (last hidden state
+    [B, L, H], mask [B, L]); samples with different image counts run as separate calls, right-padded to one L.
+    `inputs`: [(sample indices, processor output)] made beforehand (on the CPU, by a dataloader worker: CpuInputs),
+    else built here."""
+    images = as_image_lists(images)
     if inputs is None:
-        inputs = iface.build_qwenvl_inputs(images=[[im] for im in images], instructions=langs)
-    else:
-        inputs = inputs.to(next(iface.parameters()).device, non_blocking=True)
-    out = iface(**inputs, output_hidden_states=True, return_dict=True, logits_to_keep=1)
-    h = out.hidden_states[-1]
-    mask = inputs.get("attention_mask", None)
-    mask = torch.ones(h.shape[:2], dtype=torch.bool, device=h.device) if mask is None else mask.to(h.device).bool()
-    return h, mask
+        inputs = [(idx, iface.build_qwenvl_inputs(images=[images[i] for i in idx], instructions=[langs[i] for i in idx]))
+                  for idx in image_groups(images)]
+    dev = next(iface.parameters()).device
+    parts = []
+    for idx, inp in inputs:
+        inp = inp.to(dev, non_blocking=True)
+        out = iface(**inp, output_hidden_states=True, return_dict=True, logits_to_keep=1)
+        h = out.hidden_states[-1]
+        m = inp.get("attention_mask", None)
+        m = torch.ones(h.shape[:2], dtype=torch.bool, device=h.device) if m is None else m.to(h.device).bool()
+        parts.append((idx, h, m))
+    if len(parts) == 1 and parts[0][0] == list(range(len(images))):
+        return parts[0][1], parts[0][2]
+    L = max(h.shape[1] for _, h, _ in parts)
+    h0 = parts[0][1]
+    hs = h0.new_zeros(len(images), L, h0.shape[2])
+    ms = torch.zeros(len(images), L, dtype=torch.bool, device=h0.device)
+    for idx, h, m in parts:
+        ix = torch.tensor(idx, device=h0.device)
+        hs[ix, :h.shape[1]], ms[ix, :h.shape[1]] = h, m
+    return hs, ms
 
 
 class CpuInputs:
@@ -84,8 +118,10 @@ class CpuInputs:
 
     def __call__(self, batch):
         torch.set_num_threads(2)
-        images, langs = [[ex["image"]] for ex in batch], [ex["lang"] for ex in batch]
-        return {n: build(stand_in, images=images, instructions=langs) for n, (build, stand_in) in self.parts.items()}
+        images, langs = [ex_images(ex) for ex in batch], [ex["lang"] for ex in batch]
+        groups = image_groups(images)
+        return {n: [(idx, build(stand_in, images=[images[i] for i in idx], instructions=[langs[i] for i in idx]))
+                    for idx in groups] for n, (build, stand_in) in self.parts.items()}
 
 
 class Streams:
@@ -109,7 +145,7 @@ def _acc(pred: torch.Tensor, tgt: torch.Tensor, w: torch.Tensor) -> float:
 
 def step_vlm(model, name, iface, streams: Streams, batch, t5: Optional[FrozenT5Encoder], w, dev):
     """One VLM on one batch -> (weighted loss, logs)."""
-    h = vlm_frames(iface, [ex["image"] for ex in batch], [ex["lang"] for ex in batch])
+    h = vlm_frames(iface, [ex_images(ex) for ex in batch], [ex["lang"] for ex in batch])
     return step_all(model, {name: h}, {name: streams}, batch, t5, w, dev)
 
 
@@ -229,16 +265,37 @@ def step_all(model, hidden: dict, streams: dict, batch, t5: Optional[FrozenT5Enc
 
 @torch.no_grad()
 def evaluate(model, vlms, t5, cfg, rank: int, world: int, dev) -> dict:
-    """Held-out streams (cfg.eval: splits, max_episodes, batch_size, max_updates): every episode walked from frame 0
-    every data.stride frames (no jitter), the memory carried over the whole walk (no truncation). Per VLM: episode /
-    subtask progress MAE, progress bin accuracy, current-subtask and finished-subtask accuracy (annotated episodes).
-    The episodes are split over the ranks; the sums are all-reduced. -> {"<vlm>/<metric>": value, ...}."""
+    """Held-out streams: cfg.eval.splits of data.root (keys "<vlm>/<metric>", "mean/<metric>"), or with cfg.eval.sources
+    ([{name, root, splits, subtasks_dir, cameras, max_episodes, max_updates}]) each source on its own (the same keys
+    under "<source>/"). -> {key: value, ...}."""
     ec, dc = cfg.eval, cfg.data
-    eps = load_index(dc.root, list(ec.splits), int(dc.get("min_frames", 1)))
-    if ec.get("max_episodes", 0) and len(eps) > int(ec.max_episodes):
-        eps = random.Random(0).sample(eps, int(ec.max_episodes))
-    ds = EgoDexFrames(dc.root, eps, load_subtasks(dc.get("subtasks_dir", None)))
-    stride, bs, cap = int(dc.stride), int(ec.batch_size), int(ec.max_updates)
+    if not ec.get("sources", None):
+        eps = load_index(dc.root, list(ec.splits), int(dc.get("min_frames", 1)))
+        return evaluate_episodes(model, vlms, t5, eps, EgoDexFrames(dc.root, eps, None), cfg, rank, world, dev,
+                                 load_subtasks(dc.get("subtasks_dir", None)), int(ec.get("max_episodes", 0)),
+                                 int(ec.max_updates))
+    res = {}
+    for src in ec.sources:
+        src = OmegaConf.to_container(src, resolve=True)
+        eps, subs = load_sources([src], int(dc.get("min_frames", 1)))
+        r = evaluate_episodes(model, vlms, t5, eps, EgoDexFrames(None, eps, None), cfg, rank, world, dev, subs,
+                              int(src.get("max_episodes", ec.get("max_episodes", 0))),
+                              int(src.get("max_updates", ec.max_updates)))
+        res.update({f"{src['name']}/{k}": v for k, v in r.items()})
+    return res
+
+
+@torch.no_grad()
+def evaluate_episodes(model, vlms, t5, eps, ds, cfg, rank, world, dev, subtasks, max_episodes: int, cap: int) -> dict:
+    """Every episode (a seeded sample of max_episodes) walked from frame 0 every data.stride frames (no jitter), up to
+    `cap` updates, the memory carried over the whole walk (no truncation). Per VLM: episode / subtask progress MAE,
+    progress bin accuracy, current-subtask and finished-subtask accuracy (annotated episodes). The episodes are split
+    over the ranks; the sums are all-reduced."""
+    ec, dc = cfg.eval, cfg.data
+    if max_episodes and len(eps) > max_episodes:
+        eps = random.Random(0).sample(eps, max_episodes)
+    ds.episodes, ds.subtasks = eps, subtasks
+    stride, bs = int(dc.stride), int(ec.batch_size)
     names = list(vlms)
     keys = ["progress_ae", "progress_hit", "n", "subtask_hit", "subtask_progress_ae", "n_sub", "done_hit", "n_done"]
     acc = torch.zeros(len(names), len(keys), dtype=torch.float64, device=dev)
@@ -259,7 +316,7 @@ def evaluate(model, vlms, t5, cfg, rank: int, world: int, dev) -> dict:
             has = torch.tensor([bool(c) for c in cands], device=dev)
             feats, cvalid = t5.candidates(cands) if (t5 is not None and bool(has.any())) else (None, None)
             for vi, name in enumerate(names):
-                h, mask = vlm_frames(vlms[name], [ex["image"] for ex in items], [ex["lang"] for ex in items])
+                h, mask = vlm_frames(vlms[name], [ex_images(ex) for ex in items], [ex["lang"] for ex in items])
                 full_h = h.new_zeros(len(group), h.shape[1], h.shape[2])
                 full_m = torch.zeros(len(group), h.shape[1], dtype=torch.bool, device=dev)
                 full_h[live], full_m[live] = h, mask
@@ -327,8 +384,8 @@ def wandb_log(run, row: dict, step: int, prefix: str = ""):
 
 
 def dc_subtasks(cfg) -> bool:
-    """Subtask annotations configured (data.subtasks_dir)."""
-    return bool(cfg.data.get("subtasks_dir", None))
+    """Subtask annotations configured (data.subtasks_dir, or any data.sources' subtasks_dir)."""
+    return bool(cfg.data.get("subtasks_dir", None)) or any(s.get("subtasks_dir", None) for s in cfg.data.get("sources", []) or [])
 
 
 def allreduce_grads(params, world):
@@ -425,13 +482,19 @@ def main():
             print(f"[resume] {path} (step {step}); streams restart at new episodes", flush=True)
 
     dc = cfg.data
-    loader, eps = build_stream_loader(dc.root, list(dc.splits), dc.per_device_batch_size, stride=dc.stride,
-                                      jitter=dc.jitter, min_frames=int(dc.get("min_frames", 1)), seed=seed * 1000 + step,
-                                      num_workers=dc.num_workers, subtasks_dir=dc.get("subtasks_dir", None),
+    sources = OmegaConf.to_container(dc.sources, resolve=True) if dc.get("sources", None) else None
+    loader, eps = build_stream_loader(dc.get("root", None), list(dc.get("splits", [])), dc.per_device_batch_size,
+                                      stride=dc.stride, jitter=dc.jitter, min_frames=int(dc.get("min_frames", 1)),
+                                      seed=seed * 1000 + step, num_workers=dc.num_workers,
+                                      subtasks_dir=dc.get("subtasks_dir", None), sources=sources,
                                       prepare=CpuInputs(vlms) if dc.get("cpu_inputs", True) and dc.num_workers else None)
     if rank == 0:
-        print(f"[data] {len(eps)} episodes, {sum(int(e['n']) for e in eps) / eps[0]['fps'] / 3600:.0f} h; "
-              f"{world} ranks x {dc.per_device_batch_size} streams", flush=True)
+        hours = {}
+        for e in eps:
+            k = e.get("_source", "data")
+            hours[k] = hours.get(k, 0.0) + int(e["n"]) / float(e["fps"]) / 3600
+        print(f"[data] {len(eps)} episodes, " + ", ".join(f"{k} {v:.0f} h" for k, v in hours.items()) +
+              f"; {world} ranks x {dc.per_device_batch_size} streams", flush=True)
 
     if cfg.get("eval", None) and cfg.eval.get("only", False):  # evaluate the resumed (or initial) model and stop
         ev = evaluate(model, vlms, t5, cfg, rank, world, dev)
@@ -440,7 +503,7 @@ def main():
             with open(out_dir / "eval.jsonl", "a") as f:
                 f.write(json.dumps(ev) + "\n")
             wandb_log(wb, ev, step, "eval/")
-            print("[eval] " + " ".join(f"{k}={v:.4g}" for k, v in ev.items() if k.startswith("mean/")), flush=True)
+            print("[eval] " + " ".join(f"{k}={v:.4g}" for k, v in ev.items() if "mean/" in k), flush=True)
         if wb is not None:
             wb.finish()
         if world > 1:
@@ -459,7 +522,7 @@ def main():
         t_data = time.time() - t_data
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
-        hidden = {n: vlm_frames(iface, [ex["image"] for ex in batch], [ex["lang"] for ex in batch], pre.get(n))
+        hidden = {n: vlm_frames(iface, [ex_images(ex) for ex in batch], [ex["lang"] for ex in batch], pre.get(n))
                   for n, iface in vlms.items()}
         total, logs = step_all(model, hidden, streams, batch, t5, w, dev)
         opt.zero_grad(set_to_none=True)
@@ -504,7 +567,7 @@ def main():
                     with open(out_dir / "eval.jsonl", "a") as f:
                         f.write(json.dumps(ev) + "\n")
                     wandb_log(wb, ev, step, "eval/")
-                    print("[eval] " + " ".join(f"{k}={v:.4g}" for k, v in ev.items() if k.startswith("mean/")), flush=True)
+                    print("[eval] " + " ".join(f"{k}={v:.4g}" for k, v in ev.items() if "mean/" in k), flush=True)
     if rank == 0 and step >= tc.max_steps:
         (out_dir / "DONE").write_text(f"{step}\n")  # the sbatch chain stops here
     if wb is not None:

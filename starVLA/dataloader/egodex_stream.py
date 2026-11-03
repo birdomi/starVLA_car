@@ -6,10 +6,16 @@ Every batch position ("slot") walks whole episodes from frame 0, one step every 
 stored fps; at an episode's end the slot moves on to a new random episode. The walk lives in the batch sampler (main
 process), so batch k + 1 of a slot always continues batch k, also with prefetching workers.
 
-A batch is a list of dicts: image (PIL), lang, progress t / (T - 1), elapsed (s), stream [slot, step in the episode,
-episode counter of the slot], and with subtask annotations (annotate_subtasks.py output, `subtasks_dir`): subtasks
-(texts of the episode's subtasks, [] when not annotated), sub_cur (index of the subtask in progress), sub_progress
-((t - start) / (end - start) of that subtask, in [0, 1]), sub_done (bool per subtask: ended at or before the frame)."""
+A batch is a list of dicts: image (PIL, the main camera), images (the source's cameras, the main one first), lang,
+progress t / (T - 1), elapsed (s), source (its name), stream [slot, step in the episode, episode counter of the
+slot], and with subtask annotations (annotate_subtasks.py output, `subtasks_dir`): subtasks (texts of the episode's
+subtasks, [] when not annotated), sub_cur (index of the subtask in progress), sub_progress ((t - start) / (end - start)
+of that subtask, in [0, 1]), sub_done (bool per subtask: ended at or before the frame).
+
+Several datasets stream together as `sources` ({name, root, splits, subtasks_dir, cameras}, load_sources): each
+episode keeps its root and cameras ("main": jpeg / offsets; "left_wrist", "right_wrist": jpeg_<cam> / offsets_<cam>,
+examples/realRobots/AgiBot/tools/agibot_frames.py). New episodes are drawn uniformly, so each source contributes in
+proportion to its total duration."""
 import glob
 import io
 import json
@@ -52,9 +58,29 @@ def load_subtasks(subtasks_dir: Optional[str]) -> Dict[str, list]:
     return out
 
 
+def load_sources(sources: Sequence[dict], min_frames: int = 1):
+    """[{name, root, splits, subtasks_dir, cameras (default [main])}] -> (episodes, subtasks): every source's index rows
+    tagged with _root / _source / _cams, and the union of their subtask annotations (episode paths are unique)."""
+    eps, subs = [], {}
+    for src in sources:
+        rows = load_index(src["root"], list(src["splits"]), min_frames)
+        cams = list(src.get("cameras", None) or ["main"])
+        for r in rows:
+            r["_root"], r["_source"], r["_cams"] = str(src["root"]), str(src.get("name", src["root"])), cams
+        eps += rows
+        subs.update(load_subtasks(src.get("subtasks_dir", None)))
+    return eps, subs
+
+
+def _jpeg(z, cam: str, t: int) -> Image.Image:
+    suffix = "" if cam == "main" else "_" + cam
+    o = z["offsets" + suffix]
+    return Image.open(io.BytesIO(z["jpeg" + suffix][o[t]:o[t + 1]].tobytes())).convert("RGB")
+
+
 class EgoDexFrames(Dataset):
     def __init__(self, root: str, episodes: List[dict], subtasks: Optional[Dict[str, list]] = None):
-        self.root, self.episodes, self.subtasks = Path(root), episodes, subtasks or {}
+        self.root, self.episodes, self.subtasks = Path(root) if root else None, episodes, subtasks or {}
 
     def __len__(self):
         return len(self.episodes)
@@ -62,9 +88,9 @@ class EgoDexFrames(Dataset):
     def __getitem__(self, item):
         slot, e, t, step, count = item
         ep = self.episodes[e]
-        with np.load(self.root / ep["path"]) as z:
-            o = z["offsets"]
-            img = Image.open(io.BytesIO(z["jpeg"][o[t]:o[t + 1]].tobytes())).convert("RGB")
+        root = Path(ep["_root"]) if "_root" in ep else self.root
+        with np.load(root / ep["path"]) as z:
+            images = [_jpeg(z, cam, t) for cam in ep.get("_cams", ["main"])]
         n, sec = int(ep["n"]), t / float(ep["fps"])
         sub = self.subtasks.get(ep["path"], [])
         cur = max(next((j for j, s in enumerate(sub) if sec < s["end"]), len(sub) - 1), 0)
@@ -72,8 +98,9 @@ class EgoDexFrames(Dataset):
         if sub:
             a, b = float(sub[cur]["start"]), float(sub[cur]["end"])
             sp = min(max((sec - a) / max(b - a, 1e-6), 0.0), 1.0)
-        return {"image": img, "lang": ep["description"], "progress": t / max(n - 1, 1), "elapsed": sec,
-                "stream": np.array([slot, step, count], dtype=np.int64), "subtasks": [s["text"] for s in sub],
+        return {"image": images[0], "images": images, "lang": ep["description"], "progress": t / max(n - 1, 1),
+                "elapsed": sec, "source": ep.get("_source", ""), "stream": np.array([slot, step, count], dtype=np.int64),
+                "subtasks": [s["text"] for s in sub],
                 "sub_cur": cur, "sub_progress": sp, "sub_done": [s["end"] <= sec for s in sub]}
 
 
@@ -114,11 +141,15 @@ class _Collate:
         return batch if self.prepare is None else (batch, self.prepare(batch))
 
 
-def build_stream_loader(root: str, splits: Sequence[str], batch_size: int, stride: int = 10, jitter: int = 3,
+def build_stream_loader(root: Optional[str], splits: Sequence[str], batch_size: int, stride: int = 10, jitter: int = 3,
                         min_frames: int = 1, seed: int = 0, num_workers: int = 8, prefetch_factor: int = 4,
-                        subtasks_dir: Optional[str] = None, prepare=None):
-    eps = load_index(root, splits, min_frames)
-    ds = EgoDexFrames(root, eps, load_subtasks(subtasks_dir))
+                        subtasks_dir: Optional[str] = None, prepare=None, sources: Optional[Sequence[dict]] = None):
+    """One dataset (root, splits, subtasks_dir), or several (`sources`, load_sources)."""
+    if sources:
+        eps, subs = load_sources(sources, min_frames)
+    else:
+        eps, subs = load_index(root, splits, min_frames), load_subtasks(subtasks_dir)
+    ds = EgoDexFrames(root, eps, subs)
     loader = DataLoader(ds, batch_sampler=StreamWalkSampler(eps, batch_size, stride, jitter, seed),
                         num_workers=num_workers, collate_fn=_Collate(prepare),
                         prefetch_factor=prefetch_factor if num_workers else None,
