@@ -270,3 +270,7 @@ car3task_preds/
 /starvla_server_client.zip
 /*.png
 *.log.nice5
+
+# crash dumps and local review pages / evaluation dumps
+/core
+/subtask_review/

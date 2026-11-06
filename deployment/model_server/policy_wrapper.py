@@ -22,6 +22,7 @@ Exposed API:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -66,7 +67,13 @@ class PolicyServerWrapper:
         logging.info("PolicyServerWrapper: loading framework from %s", self._ckpt_path)
         framework = baseframework.from_pretrained(self._ckpt_path, config_overrides=config_overrides)
         if use_bf16:
-            framework = framework.to(torch.bfloat16)
+            # STARVLA_BF16_VLM_ONLY=1: only the VLM in bf16; the rest (episode memory, DiT) stays fp32 as trained and as
+            # the car memory deploy (examples/realRobots/H1_2_car_real/deploy_memory) -- a recurrent memory otherwise
+            # carries bf16 rounding from update to update across the episode
+            if os.environ.get("STARVLA_BF16_VLM_ONLY", "0") == "1" and hasattr(framework, "qwen_vl_interface"):
+                framework.qwen_vl_interface.to(torch.bfloat16)
+            else:
+                framework = framework.to(torch.bfloat16)
         framework = framework.to(device).eval()
         self._framework = framework
 
@@ -94,6 +101,11 @@ class PolicyServerWrapper:
 
         # Peek at available keys without building a full processor.
         self._available_unnorm_keys: List[str] = list(norm_stats.keys())
+
+        # Episode-memory models (episode_memory.stream): client slot -> (committed memory, episode time of its update).
+        # The memory advances at most once per STARVLA_MEM_INTERVAL_S of episode time (training drew 0.7 - 1.3 s).
+        self._mem: Dict[str, Any] = {}
+        self._mem_interval = float(os.environ.get("STARVLA_MEM_INTERVAL_S", "1.0"))
 
         # Eagerly build when unambiguous; defer for multi-key / no explicit key.
         if unnorm_key is not None or len(self._available_unnorm_keys) == 1:
@@ -207,7 +219,10 @@ class PolicyServerWrapper:
                 else:               # loader delta convention: past slot i = a[i] - a[i+1], a[P] := current qpos
                     nxt = np.concatenate([hist[1:], cur], axis=0)
                     ex["past_action"] = proc.apply_actions(hist - nxt)
-        out = self._framework.predict_action(examples=examples, **kwargs)
+        if any("mem_slot" in ex for ex in examples):
+            out = self._predict_with_memory(examples, **kwargs)
+        else:
+            out = self._framework.predict_action(examples=examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
 
         unnorm = np.stack(
@@ -218,3 +233,20 @@ class PolicyServerWrapper:
         if out.get("plan_kf") is not None:  # QwenGR00T_DualSystem fast System 1: the client keeps System 2's plan
             res["plan_kf"] = np.asarray(out["plan_kf"])
         return res
+
+    def _predict_with_memory(self, examples: List[dict], **kwargs) -> Dict[str, np.ndarray]:
+        """Stream episode memory (QwenGR00T_EpisodeMemory): each example carries ``mem_slot`` (client env id),
+        ``mem_t`` (seconds since its episode start) and ``mem_reset`` (episode start). The memory advances on the
+        frame of a call at least ``STARVLA_MEM_INTERVAL_S`` after the last update; calls in between use the committed
+        memory updated with their frame and drop that update (as examples/realRobots/H1_2_car_real/deploy_memory)."""
+        if not self._mem:
+            logging.info("episode memory: carried per client slot, update interval %.2f s", self._mem_interval)
+        outs = []
+        for ex in examples:
+            slot, t, reset = str(ex.pop("mem_slot")), float(ex.pop("mem_t")), bool(ex.pop("mem_reset"))
+            mem, t_mem = (None, None) if reset else self._mem.get(slot, (None, None))
+            out = self._framework.predict_action(examples=[ex], memory=mem, **kwargs)
+            if mem is None or t - t_mem >= self._mem_interval - 1e-6:
+                self._mem[slot] = (out["memory"], t)
+            outs.append(np.asarray(out["normalized_actions"]))
+        return {"normalized_actions": np.concatenate(outs, axis=0)}

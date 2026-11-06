@@ -119,7 +119,8 @@ def build_param_lr_groups(model, cfg):
         try:
             for attr in freeze_path.split("."):
                 module = getattr(module, attr)
-            frozen_params.update(id(p) for p in module.parameters())
+            # a path may also name a bare nn.Parameter (e.g. episode_memory.init_tokens)
+            frozen_params.update(id(p) for p in ([module] if isinstance(module, torch.nn.Parameter) else module.parameters()))
         except AttributeError:
             print(f"⚠️ freeze module path does not exist: {freeze_path}")
             continue
@@ -127,7 +128,10 @@ def build_param_lr_groups(model, cfg):
     # params the framework itself froze (requires_grad=False) never enter the optimizer
     frozen_params.update(id(p) for p in model.parameters() if not p.requires_grad)
 
-    for module_name, lr in lr_cfg.items():
+    # deeper paths first (stable for equal depth), and a parameter joins only the first group that claims it: a nested
+    # path (e.g. episode_memory.blocks: 1e-5) carves its parameters out of its parent's group (episode_memory: 1e-4)
+    # instead of putting them in two optimizer groups
+    for module_name, lr in sorted(lr_cfg.items(), key=lambda kv: -kv[0].count(".")):
         if module_name == "base":
             continue
         # try to find the module under vla by module_name (support nested paths)
@@ -135,8 +139,8 @@ def build_param_lr_groups(model, cfg):
         try:
             for attr in module_name.split("."):
                 module = getattr(module, attr)
-            # filter out frozen parameters
-            params = [p for p in module.parameters() if id(p) not in frozen_params]
+            # filter out frozen parameters and those a deeper path already took
+            params = [p for p in module.parameters() if id(p) not in frozen_params and id(p) not in used_params]
             if params:  # only add param group if there are trainable parameters
                 param_groups.append({"params": params, "lr": lr, "name": module_name})
                 used_params.update(id(p) for p in params)
@@ -223,7 +227,9 @@ class TrainerUtils:
                     for attr in attrs:
                         module = getattr(module, attr)
                     # if the module is successfully get, freeze it and its all submodule parameters
-                    for param in module.parameters():
+                    # (a path may also name a bare nn.Parameter, e.g. episode_memory.init_tokens)
+                    params = [module] if isinstance(module, torch.nn.Parameter) else module.parameters()
+                    for param in params:
                         param.requires_grad = False
                     frozen.append(path)
                 except AttributeError:

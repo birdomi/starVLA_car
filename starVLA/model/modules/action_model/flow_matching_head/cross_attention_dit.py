@@ -275,7 +275,20 @@ class BasicTransformerBlock(nn.Module):
             hidden_states = hidden_states.squeeze(1)
 
         if self.attn_mem is not None and memory_states is not None:
-            hidden_states = hidden_states + self.attn_mem(self.norm_mem(hidden_states), encoder_hidden_states=memory_states)
+            q = self.norm_mem(hidden_states)
+            n, m = q.shape[0], memory_states.shape[0]
+            if n == m:
+                hidden_states = hidden_states + self.attn_mem(q, encoder_hidden_states=memory_states)
+            else:
+                # memory_states [B, N, D_m] shared by the r stacked copies of the batch in hidden_states ([r * B, T, D], as
+                # x.repeat(r, 1, 1) lays them out): the r copies' queries attend to one key / value set per sample, the
+                # same result as repeating the memory r times without its r-fold key / value projections and storage
+                if n % m:
+                    raise ValueError(f"memory_states batch {m} does not divide the hidden batch {n}")
+                r, t, d = n // m, q.shape[1], q.shape[2]
+                q = q.reshape(r, m, t, d).transpose(0, 1).reshape(m, r * t, d)
+                out = self.attn_mem(q, encoder_hidden_states=memory_states)
+                hidden_states = hidden_states + out.reshape(m, r, t, d).transpose(0, 1).reshape(n, t, d)
 
         # 4. Feed-forward
         if self.ffn_progress_adanorm is not None and progress_vector is not None:
