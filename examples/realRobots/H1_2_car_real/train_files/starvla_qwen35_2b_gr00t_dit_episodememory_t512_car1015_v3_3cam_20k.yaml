@@ -1,5 +1,5 @@
 # QwenGR00T_EpisodeMemory on car-1015-v3-ep, fine-tuned from the Qwen3.5-2B DiT baseline
-# (starvla_qwen35_2b_gr00t_dit_car1015_v3_3cam_50k.yaml, steps_50000). The streamed gated-attention episode memory of
+# (starvla_qwen35_2b_gr00t_dit_car1015_v3_3cam_50k.yaml, final_model). The streamed gated-attention episode memory of
 # starvla_qwengr00t_dit_episodememory_car1015_3cam.yaml (0.8B, car-1015-v1), with one change so that the 2B and 4B runs
 # share the same memory architecture:
 #  * token_dim 512: an MLP (LayerNorm -> Linear(H, 512) -> GELU -> Linear(512, 512), episode_memory.token_resize) maps
@@ -85,7 +85,7 @@ datasets:
 
 trainer:
   # strict=False load: only episode_memory.* and the DiT's norm_mem / attn_mem keys are missing
-  pretrained_checkpoint: playground/Checkpoints/starvla_qwen35_2b_dit_car1015_v3_3cam_50k_b512/checkpoints/steps_50000_pytorch_model.pt
+  pretrained_checkpoint: playground/Checkpoints/starvla_qwen35_2b_dit_car1015_v3_3cam_50k_b512/final_model/pytorch_model.pt
   max_train_steps: 20000
   num_warmup_steps: 1000
   save_interval: 5000

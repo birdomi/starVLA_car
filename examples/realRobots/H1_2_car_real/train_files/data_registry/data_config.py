@@ -23,9 +23,12 @@ Design choices, each backed by a measurement on this data:
     room for synchronous chunk execution).
 """
 
+import numpy as np
+import torch
+
 from starVLA.dataloader.gr00t_lerobot.datasets import ModalityConfig
 from starVLA.dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
-from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform
+from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform, ModalityTransform
 from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionToTensor, StateActionTransform
 
 _ABS_ACTION_KEYS = [  # grip targets are absolute (not rel-anchored)
@@ -282,6 +285,32 @@ class H12Car3CamNoHeadCmdDataConfig(H12CarTurnSignal3CamDataConfig):
         return cfg
 
 
+class HandCh2Clip(ModalityTransform):
+    """Clip hand channel 2 (index 2 of each 13-D hand key) to <= max_value, as prepare_car1015_dataset.py does to the
+    car-1015-v3 action (CH2_MAX 1650: the measured hand state saturates at ~1652). Not invertible (skipped on unapply)."""
+
+    max_value: float = 1650.0
+
+    def apply(self, data: dict) -> dict:
+        for k in self.apply_to:
+            x = data[k]
+            x[..., 2] = x[..., 2].clamp(max=self.max_value) if torch.is_tensor(x) else np.minimum(x[..., 2], self.max_value)
+        return data
+
+
+class H12Car3CamCh2ClipDataConfig(H12Car3CamNoHeadCmdDataConfig):
+    """H12Car3CamNoHeadCmdDataConfig for the raw car exports merged into car-1015-v3 (car-0901-ov, car-3rd-ov overlays,
+    prepare_car_v3.py): their action is not ch2-clipped on disk, so the clip runs here, before q99 normalization."""
+
+    def transform(self):
+        composed = super().transform()
+        ts = list(composed.transforms)
+        i = next(j for j, t in enumerate(ts) if isinstance(t, StateActionTransform) and t.apply_to == self.action_keys)
+        ts.insert(i, HandCh2Clip(apply_to=["action.left_ee", "action.right_ee"]))
+        composed.transforms = ts
+        return composed
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     # 3 cameras, 40-D state at t, a[t .. t+49]; frames t (sync) or [t - 15, t] (Helix_VLA s2_lag 15)
     "h1_2_car_3cam_nohc": H12Car3CamNoHeadCmdDataConfig(video_offsets=(0,)),
@@ -291,6 +320,8 @@ ROBOT_TYPE_CONFIG_MAP = {
     # 42-D state = recorded head state (s0:2) + arms + hands at t (Helix_VLA)
     "h1_2_car_3cam_vlm15_headstate": H12Car3CamNoHeadCmdDataConfig(video_offsets=(-15, 0), head_state=True),
     "h1_2_car_3cam_headstate": H12Car3CamNoHeadCmdDataConfig(video_offsets=(0,), head_state=True),  # frames t (QwenGR00T)
+    # same, for the unclipped raw exports merged into car-1015-v3 (car-0901-ov, car-3rd-ov): hand ch2 action clipped to 1650
+    "h1_2_car_3cam_headstate_ch2clip": H12Car3CamCh2ClipDataConfig(video_offsets=(0,), head_state=True),
     # frames t - 60, -45, -30, -15, t (every 0.5 s over the last 2 s; QwenGR00T_EpisodeMemory update_offsets)
     "h1_2_car_3cam_mem60_headstate": H12Car3CamNoHeadCmdDataConfig(video_offsets=(-60, -45, -30, -15, 0), head_state=True),
     "h1_2_car_turn_3cam": H12CarTurnSignal3CamDataConfig(),
@@ -428,4 +459,20 @@ DATASET_NAMED_MIXTURES = {
     "car1015_v3_val_3cam_headstate": [("car-1015-v3-ep/val", 1.0, "h1_2_car_3cam_headstate")],
     "car1015_v3_3cam_mem60_headstate": [("car-1015-v3-ep/train", 1.0, "h1_2_car_3cam_mem60_headstate")],
     "car1015_v3_val_3cam_mem60_headstate": [("car-1015-v3-ep/val", 1.0, "h1_2_car_3cam_mem60_headstate")],
+    # car-v3 (10-29, prepare_car_v3.py): car-1015-v3 + car-0901-0923 (only episodes not already in v3, incl. the
+    # tasks v3 dropped) + car_data_3rd (1019-1027, washer tasks new), rule_v1-filtered, deduplicated by arm trajectory;
+    # a val episode found in ANY train set is trained on. Needs datasets.vla_data.episode_lists:
+    # examples/realRobots/H1_2_car_real/car_v3_episode_lists.json (train mixture) / car_v3_episode_lists_val.json
+    # (val mixture): per-dataset include ids. Set datasets.vla_data.balance_dataset_weights: true (sample by frames).
+    "car_v3_3cam_headstate": [
+        ("car-1015-v3-ep/train", 1.0, "h1_2_car_3cam_headstate"),
+        ("car-1015-v3-ep/val", 1.0, "h1_2_car_3cam_headstate"),  # only the val episodes duplicated in car-0901 train
+        ("car-0901-ov/train", 1.0, "h1_2_car_3cam_headstate_ch2clip"),
+        ("car-3rd-ov/train", 1.0, "h1_2_car_3cam_headstate_ch2clip"),
+    ],
+    "car_v3_val_3cam_headstate": [
+        ("car-1015-v3-ep/val", 1.0, "h1_2_car_3cam_headstate"),
+        ("car-0901-ov/val", 1.0, "h1_2_car_3cam_headstate_ch2clip"),
+        ("car-3rd-ov/val", 1.0, "h1_2_car_3cam_headstate_ch2clip"),
+    ],
 }

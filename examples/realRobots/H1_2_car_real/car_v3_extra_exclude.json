@@ -1,0 +1,213 @@
+{
+ "_doc": "car-v3 extra exclusions (2026-10-29, scan of the kept episodes): state_dropout = a hand / head state group reads exactly 0 for >= 30 frames (sensor dropout; inside the rule_v1 hand range); *_cmd_jump>15deg = a frame-to-frame arm / head command step > 15 deg that does not come back (rule_v1 head_spike / arm_spike only catch returning spikes). Applied by prepare_car_v3.py as 'exclude' ids of car_v3_episode_lists{,_val}.json.",
+ "car-0901-ov/train": {
+  "160": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "turn on the whole interior light using driver side button and inspect its operation"
+  },
+  "1023": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "turn off the whole interior light using driver side button and inspect its operation"
+  },
+  "1180": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "turn on the hazard lights using the center hazard light button and inspect their operation"
+  },
+  "1302": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "turn off the hazard lights using the center hazard light button and inspect their operation"
+  },
+  "1626": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "turn off the hazard lights using the center hazard light button and inspect their operation"
+  },
+  "1756": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "turn on the whole interior light using driver side button and inspect its operation"
+  },
+  "2222": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "turn on the whole interior light using driver side button and inspect its operation"
+  },
+  "2741": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "turn off the whole interior light using driver side button and inspect its operation"
+  },
+  "3198": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "turn on the hazard lights using the center hazard light button and inspect their operation"
+  },
+  "3665": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "turn off the whole interior light using driver side button and inspect its operation"
+  },
+  "5234": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "turn off the whole interior light using driver side button and inspect its operation"
+  },
+  "5406": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "turn on the whole interior light using driver side button and inspect its operation"
+  }
+ },
+ "car-3rd-ov/train": {
+  "908": {
+   "reason": "state_dropout",
+   "final": "train",
+   "task": "operate the windshield wiper once and inspect its operation"
+  },
+  "968": {
+   "reason": "state_dropout",
+   "final": "train",
+   "task": "turn on the hazard lights using the center hazard light button and inspect their operation"
+  },
+  "1220": {
+   "reason": "state_dropout",
+   "final": "train",
+   "task": "operate the windshield wiper at speed setting 2 and inspect its operation"
+  }
+ },
+ "car-3rd-ov/val": {
+  "77": {
+   "reason": "state_dropout",
+   "final": "val",
+   "task": "activate the right turn signal and inspect its operation"
+  }
+ },
+ "car-1015-v3-ep/train": {
+  "78": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "start the engine and inspect its operation"
+  },
+  "313": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "start the engine and inspect its operation"
+  },
+  "860": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "start the engine and inspect its operation"
+  },
+  "1641": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "activate the left turn signal and inspect its operation"
+  },
+  "1945": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "operate the windshield wiper at speed setting 2 and inspect its operation"
+  },
+  "2020": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "activate the left turn signal and inspect its operation"
+  },
+  "2236": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "operate the windshield wiper twice and inspect its operation"
+  },
+  "2338": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "start the engine and inspect its operation"
+  },
+  "3728": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "operate the windshield wiper at speed setting 2 and inspect its operation"
+  },
+  "5281": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "start the engine and inspect its operation"
+  },
+  "6198": {
+   "reason": "state_dropout",
+   "final": "train",
+   "task": "activate the left turn signal and inspect its operation"
+  },
+  "7512": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "start the engine and inspect its operation"
+  },
+  "8164": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "activate the right turn signal and inspect its operation"
+  },
+  "9437": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "start the engine and inspect its operation"
+  },
+  "9657": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "start the engine and inspect its operation"
+  },
+  "10681": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "start the engine and inspect its operation"
+  },
+  "11641": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "operate the windshield wiper twice and inspect its operation"
+  },
+  "13412": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "start the engine and inspect its operation"
+  },
+  "13896": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "activate the right turn signal and inspect its operation"
+  },
+  "14000": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "start the engine and inspect its operation"
+  }
+ },
+ "car-1015-v3-ep/val": {
+  "263": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "activate the right turn signal in three flash mode and inspect its operation"
+  },
+  "350": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "activate the left turn signal and inspect its operation"
+  },
+  "447": {
+   "reason": "arm_cmd_jump>15deg",
+   "final": "train",
+   "task": "start the engine and inspect its operation"
+  },
+  "698": {
+   "reason": "head_cmd_jump>15deg",
+   "final": "train",
+   "task": "start the engine and inspect its operation"
+  }
+ }
+}
