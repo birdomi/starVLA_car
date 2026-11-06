@@ -562,6 +562,9 @@ def main():
             if cfg.get("eval", None) and cfg.eval.get("enabled", True):
                 t_ev = time.time()
                 ev = evaluate(model, vlms, t5, cfg, rank, world, dev)
+                # hand the eval's cached blocks back: kept, they left too little room for a Triton kernel load (fla, a
+                # new token count) and a rank ran out of memory right after the 30K eval (job 1224209)
+                torch.cuda.empty_cache()
                 if rank == 0:
                     ev.update({"step": step, "time/eval": time.time() - t_ev})
                     with open(out_dir / "eval.jsonl", "a") as f:
