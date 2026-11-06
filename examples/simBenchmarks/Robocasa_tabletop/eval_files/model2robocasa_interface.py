@@ -4,6 +4,7 @@ from typing import Dict, Optional, Sequence
 import cv2 as cv
 import matplotlib.pyplot as plt
 import os
+import uuid
 import numpy as np
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
@@ -88,6 +89,13 @@ class PolicyWarper:
         # model skips that memory update, the training fallback). Takes precedence over ROBOCASA_VLM_PREV_FRAME.
         self.vlm_prev_frames = int(os.environ.get("ROBOCASA_VLM_PREV_FRAMES", "0") or 0)
         self._prev_hist: list = []
+        # ROBOCASA_MEMORY=1 (QwenGR00T_EpisodeMemory, episode_memory.stream): the server carries every env's episode
+        # memory across calls. Each example sends its slot (this client's id + env index: batch_eval_args.sh can run two
+        # clients on one server), the episode time (env steps / ROBOCASA_ACTION_RATE) and, on an episode's first call,
+        # mem_reset. reset_episode() (simulation_env, every episode start) marks the next call as such.
+        self.memory = os.environ.get("ROBOCASA_MEMORY", "0") == "1"
+        self._mem_client = uuid.uuid4().hex[:8]
+        self._mem_steps: list = []  # env steps since the episode start per env (None = the next call starts one)
         self.client = WebsocketClientPolicy(host, port)
         self.policy_setup = policy_setup
         self.unnorm_key = unnorm_key
@@ -170,7 +178,10 @@ class PolicyWarper:
             self._prev_images = []
             self._prev_hist = []
             self._plan, self._plan_age = [], []
+            self._mem_steps = []
             return
+        if index < len(self._mem_steps):
+            self._mem_steps[index] = None
         if index < len(self._plan):
             self._plan[index] = None
         if index < len(self._prev_images):
@@ -206,6 +217,7 @@ class PolicyWarper:
         self._plan, self._plan_age = [], []  # ROBOCASA_S2_EVERY: client-held System 2 plan per env
         self._prev_images = []
         self._prev_hist = []
+        self._mem_steps = []
         self.task_description = task_description
         self.image_history.clear()
         if self.action_ensemble:
@@ -318,6 +330,16 @@ class PolicyWarper:
                 examples[b]["past_action_count"] = len(h)  # real executed steps (the rest is qpos padding; DualSystem corrector masks it)
                 examples[b]["current_qpos"] = raw_qpos[b].astype(np.float32)
                 examples[b]["past_mode"] = self.action_mode if self.action_mode in ("rel", "abs") else "delta"
+        if self.memory:
+            while len(self._mem_steps) < batch_size:
+                self._mem_steps.append(None)
+            for b in range(batch_size):
+                start = self._mem_steps[b] is None
+                steps = 0 if start else self._mem_steps[b]
+                examples[b]["mem_slot"] = f"{self._mem_client}:{b}"
+                examples[b]["mem_t"] = steps / self.action_rate
+                examples[b]["mem_reset"] = start
+                self._mem_steps[b] = steps + self.n_action_steps
         if self.s2_every > 0:
             while len(self._plan) < batch_size:
                 self._plan.append(None)

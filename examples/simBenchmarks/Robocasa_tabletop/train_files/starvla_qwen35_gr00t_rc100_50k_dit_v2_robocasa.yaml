@@ -12,7 +12,9 @@ version_id: "0.21"
 framework:
   name: QwenGR00T
   qwenvl:
-    base_vlm: Qwen/Qwen3.5-0.8B
+    base_vlm: playground/Pretrained_models/Qwen3.5-0.8B
+    # fla Triton kernels recompile per sequence length -> pad prompts to a multiple of 64
+    pad_to_multiple_of: 64
     attn_implementation: flash_attention_2
     # ZeRO-0 (needed by Muon) keeps no fp32 master copy, so the trained VLM
     # must hold fp32 weights; compute stays bf16 via autocast.
@@ -52,7 +54,7 @@ datasets:
     load_all_data_for_training: true
     obs_image_size: [224, 224]
     delete_pause_frame: false
-    video_backend: decord
+    video_backend: torchvision_av   # decord has no aarch64 build (Hangang GH200)
     video_backend_kwargs: {num_threads: 1}
     multiprocessing_context: fork
     num_workers: 8

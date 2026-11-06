@@ -7,8 +7,8 @@
 # === Please modify the paths to Python executables in conda environments ===
 
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-starVLA_PYTHON=~/miniconda3/envs/starVLA/bin/python
-ROBOCASA_PYTHON=~/miniconda3/envs/robocasa/bin/python
+starVLA_PYTHON=${STARVLA_PYTHON:-~/miniconda3/envs/starVLA/bin/python}
+ROBOCASA_PYTHON=${ROBOCASA_PYTHON:-~/miniconda3/envs/robocasa/bin/python}
 export PYTHONPATH=$(pwd):${PYTHONPATH}
 CKPT_DEFAULT="StarVLA/Qwen3-VL-OFT-Robocasa/checkpoints/steps_90000_pytorch_model.pt"
 
@@ -72,7 +72,7 @@ EvalEnv() {
     ${ROBOCASA_PYTHON} examples/simBenchmarks/Robocasa_tabletop/eval_files/simulation_env.py \
         --args.env_name "${ENV_NAME}" \
         --args.port "${PORT}" \
-        --args.n_episodes 50 \
+        --args.n_episodes "${N_EPISODES:-50}" \
         --args.n_envs "${N_ENVS}" \
         --args.max_episode_steps "${MAX_EPISODE_STEPS}" \
         --args.n_action_steps "${N_ACTION_STEPS}" \
