@@ -468,7 +468,8 @@ def main():
     # resume from the newest of the kept checkpoints (steps_<k>.pt) and the rolling one (latest.pt, every resume_every)
     found = []
     if tc.get("resume", True):
-        found = [(int(p.stem.split("_")[1]), p) for p in ckpt_dir.glob("steps_*[0-9].pt")]
+        # steps_<k>.pt only: a per-VLM export whose name ends in a digit (steps_<k>_memory_minicpmv46.pt) is no checkpoint
+        found = [(int(p.stem[6:]), p) for p in ckpt_dir.glob("steps_*.pt") if p.stem[6:].isdigit()]
         if (ckpt_dir / "latest.pt").exists():
             found.append((int(torch.load(ckpt_dir / "latest.pt", map_location="cpu", weights_only=False)["step"]),
                           ckpt_dir / "latest.pt"))
