@@ -172,6 +172,7 @@ ROBOT_TYPE_CONFIG_MAP = {
     "robotwin_sh16": AgilexStateHistDataConfig(16),  # 16-step observed state history
     "robotwin50": AgilexData50Config(),
     "robotwin_pf32": AgilexPastFutureDataConfig(16, 16),  # range(-16, 16): 16 past + 16 future
+    "robotwin_h50": AgilexPastFutureDataConfig(0, 50),  # 50-step chunk, robotwin normalization (robotwin50: threshold 0.49)
     "arx_x5": ArxX5DataConfig(),
     # QwenGR00T_DualSystem: a[t-30 .. t+60]; stage 1 (System 2) frame t only; stage 2 (System 1) frames t + {0, 3, 6, 9,
     # 12} = plan ages 0 .. 0.8 s

@@ -1,0 +1,116 @@
+diff --git a/envs/_base_task.py b/envs/_base_task.py
+index 3339ff9..bd857c2 100644
+--- a/envs/_base_task.py
++++ b/envs/_base_task.py
+@@ -218,10 +218,12 @@ class Base_Task(gym.Env):
+         # give renderer to sapien sim
+         self.engine.set_renderer(self.renderer)
+ 
+-        sapien.render.set_camera_shader_dir("rt")
+-        sapien.render.set_ray_tracing_samples_per_pixel(32)
+-        sapien.render.set_ray_tracing_path_depth(8)
+-        sapien.render.set_ray_tracing_denoiser("oidn")
++        # starVLA local patch: render settings via env (defaults = RoboTwin originals). Under heavy GPU
++        # sharing the rt+oidn path hangs in camera readback; ROBOTWIN_RT_DENOISER=none / lower SPP help.
++        sapien.render.set_camera_shader_dir(os.environ.get("ROBOTWIN_SHADER_DIR", "rt"))
++        sapien.render.set_ray_tracing_samples_per_pixel(int(os.environ.get("ROBOTWIN_RT_SPP", "32")))
++        sapien.render.set_ray_tracing_path_depth(int(os.environ.get("ROBOTWIN_RT_DEPTH", "8")))
++        sapien.render.set_ray_tracing_denoiser(os.environ.get("ROBOTWIN_RT_DENOISER", "oidn"))
+ 
+         # declare sapien scene
+         scene_config = sapien.SceneConfig()
+@@ -1529,6 +1531,20 @@ class Base_Task(gym.Env):
+ 
+         return True  # TODO: maybe need try error
+ 
++    def _eval_video_frame(self):
++        # local patch: ROBOTWIN_EVAL_VIDEO_GRID=1 records a 2x2 grid (third view | head / left wrist | right wrist)
++        # instead of the third view alone; eval_policy_xpolicylab.py doubles video_size to match
++        third = self.now_obs["third_view_rgb"]
++        if os.environ.get("ROBOTWIN_EVAL_VIDEO_GRID") != "1":
++            return third
++        obs = self.now_obs["observation"]
++        tiles = [third] + [obs[c]["rgb"] for c in ("head_camera", "left_camera", "right_camera")]
++        h, w = third.shape[:2]
++        if any(t.shape[:2] != (h, w) for t in tiles):
++            import cv2
++            tiles = [t if t.shape[:2] == (h, w) else cv2.resize(t, (w, h), interpolation=cv2.INTER_AREA) for t in tiles]
++        return np.ascontiguousarray(np.concatenate([np.concatenate(tiles[:2], 1), np.concatenate(tiles[2:], 1)], 0))
++
+     def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos'):  # action_type: qpos or ee
+         if self.take_action_cnt == self.step_lim or self.eval_success:
+             return
+@@ -1536,7 +1552,7 @@ class Base_Task(gym.Env):
+         eval_video_freq = 1  # fixed
+         if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
+             # self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+-            self.eval_video_ffmpeg.stdin.write(self.now_obs["third_view_rgb"].tobytes())
++            self.eval_video_ffmpeg.stdin.write(self._eval_video_frame().tobytes())
+ 
+         self.take_action_cnt += 1
+         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
+@@ -1723,7 +1739,7 @@ class Base_Task(gym.Env):
+                 self.eval_success = True
+                 self.get_obs() # update obs
+                 if (self.eval_video_path is not None):
+-                    self.eval_video_ffmpeg.stdin.write(self.now_obs["third_view_rgb"].tobytes())
++                    self.eval_video_ffmpeg.stdin.write(self._eval_video_frame().tobytes())
+                 return
+ 
+         self._update_render()
+diff --git a/scripts/eval_policy_xpolicylab.py b/scripts/eval_policy_xpolicylab.py
+index faf40ed..6ebab24 100644
+--- a/scripts/eval_policy_xpolicylab.py
++++ b/scripts/eval_policy_xpolicylab.py
+@@ -294,6 +294,8 @@ def main(usr_args: dict[str, Any]) -> None:
+     if args["eval_video_log"]:
+         camera_config = get_camera_config(args["camera"]["head_camera_type"])
+         video_size = str(camera_config["w"]) + "x" + str(camera_config["h"])
++        if os.environ.get("ROBOTWIN_EVAL_VIDEO_GRID") == "1":  # local patch: 2x2 camera grid, see _eval_video_frame
++            video_size = str(2 * camera_config["w"]) + "x" + str(2 * camera_config["h"])
+         args["eval_video_save_dir"] = save_dir
+ 
+     if os.environ.get("ROBOTWIN_SUPPRESS_EVAL_CONFIG") != "1":
+@@ -358,6 +360,8 @@ def main_batch(usr_args: dict[str, Any]) -> None:
+     if args["eval_video_log"]:
+         camera_config = get_camera_config(args["camera"]["head_camera_type"])
+         video_size = str(camera_config["w"]) + "x" + str(camera_config["h"])
++        if os.environ.get("ROBOTWIN_EVAL_VIDEO_GRID") == "1":  # local patch: 2x2 camera grid, see _eval_video_frame
++            video_size = str(2 * camera_config["w"]) + "x" + str(2 * camera_config["h"])
+         args["eval_video_save_dir"] = save_dir
+ 
+     if os.environ.get("ROBOTWIN_SUPPRESS_EVAL_CONFIG") != "1":
+@@ -798,8 +802,17 @@ def eval_remote_policy(
+     clear_cache_freq = args["clear_cache_freq"]
+     args["eval_mode"] = True
+     consecutive_env_errors = 0
++    # local patch: ROBOTWIN_EVAL_SHARD=k/K keeps only seeds st_seed + k (mod K), so K clients with test_num / K episodes
++    # each split one task deterministically (starVLA examples/simBenchmarks/RMBench/eval_files/eval_rmbench_parallel.py)
++    shard = os.environ.get("ROBOTWIN_EVAL_SHARD")
++    shard_k, shard_n = map(int, shard.split("/")) if shard else (0, 1)
++    # local patch: ROBOTWIN_EVAL_START_SEED resumes a killed shard after its last finished episode's seed
++    now_seed = max(st_seed, int(os.environ.get("ROBOTWIN_EVAL_START_SEED", st_seed)))
+ 
+     while succ_seed < test_num:
++        if (now_seed - st_seed) % shard_n != shard_k:
++            now_seed += 1
++            continue
+         render_freq = args["render_freq"]
+         args["render_freq"] = 0
+         episode_info = {"info": {}}
+@@ -842,6 +855,7 @@ def eval_remote_policy(
+             continue
+ 
+         succ_seed += 1
++        print(f"[episode-start] seed={now_seed}", flush=True)  # local patch: the driver skips seeds the sim hangs on
+ 
+         instruction = build_instruction(args, episode_info, instruction_type, test_num)
+         task_env.set_instruction(instruction=instruction)
+@@ -956,6 +970,7 @@ def eval_remote_policy(
+             print("\033[92mSuccess!\033[0m")
+         else:
+             print("\033[91mFail!\033[0m")
++        print(f"[episode] seed={now_seed} success={int(succ)} steps={rollout_steps}", flush=True)  # local patch
+ 
+         now_id += 1
+         task_env.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))

@@ -1,0 +1,28 @@
+policy_name: starVLA_dev
+protocol: ws
+host: localhost
+port: null
+bench_name: null
+task_name: null
+ckpt_name: null
+env_cfg_type: null
+seed: null
+action_type: joint
+gpu_id: null
+eval_batch: false
+
+# starVLA websocket server of THIS repo (deployment/model_server/server_policy.py), started separately on a GPU.
+# Every key below can also be set by the env var in brackets (see model.py).
+starvla_root: /mnt/DATA2/yyg/starVLA   # [STARVLA_ROOT]
+starvla_server_host: 127.0.0.1          # [STARVLA_SERVER_HOST]
+starvla_server_port: 5694               # [STARVLA_SERVER_PORT]
+unnorm_key: null                        # [STARVLA_UNNORM_KEY] null = the server's default (single-dataset ckpts)
+use_ddim: true                          # [STARVLA_USE_DDIM]
+num_ddim_steps: 10                      # [STARVLA_NUM_DDIM_STEPS]
+image_size: [224, 224]                  # [STARVLA_IMAGE_SIZE] e.g. 224,224
+execute_horizon: null                   # [STARVLA_EXECUTE_HORIZON] null = the full chunk; stream memory: its stride
+send_state: auto                        # [STARVLA_SEND_STATE] auto = datasets.vla_data.include_state of the ckpt
+state_hist: 0                           # [STARVLA_STATE_HIST] observed-state history length (past_source: state heads)
+num_past_steps: 0                       # [STARVLA_NUM_PAST_STEPS] executed-action history (PatchRegressor heads)
+memory: auto                            # [STARVLA_MEMORY] auto = stream EpisodeMemory ckpt: memory carried per episode
+control_hz: 15                          # [STARVLA_CONTROL_HZ] sim steps per second (episode time sent as mem_t)
