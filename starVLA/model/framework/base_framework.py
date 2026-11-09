@@ -57,6 +57,19 @@ def merge_config_overrides(model_config: dict, config_overrides: Sequence[str] |
         raise ValueError(f"Failed to parse config_overrides={overrides!r}: {exc}") from exc
 
 
+# module name -> import error; a framework whose deps clash with the installed versions
+# (e.g. the openpi Gemma copy vs transformers 5.x) must not block building the others.
+_FRAMEWORK_IMPORT_ERRORS: Dict[str, str] = {}
+
+
+def _try_import(module: str) -> None:
+    try:
+        importlib.import_module(module)
+    except Exception as exc:
+        _FRAMEWORK_IMPORT_ERRORS[module] = f"{type(exc).__name__}: {exc}"
+        logger.warning(f"[StarVLA] skipping framework module {module}: {type(exc).__name__}: {exc}")
+
+
 def _auto_import_framework_modules() -> None:
     global _FRAMEWORKS_IMPORTED
     if _FRAMEWORKS_IMPORTED:
@@ -75,9 +88,9 @@ def _auto_import_framework_modules() -> None:
             for _, sub_name, _ in pkgutil.iter_modules([str(sub_dir)]):
                 if sub_name.startswith("_"):
                     continue
-                importlib.import_module(f"starVLA.model.framework.{module_name}.{sub_name}")
+                _try_import(f"starVLA.model.framework.{module_name}.{sub_name}")
         else:
-            importlib.import_module(f"starVLA.model.framework.{module_name}")
+            _try_import(f"starVLA.model.framework.{module_name}")
 
     _FRAMEWORKS_IMPORTED = True
 
@@ -99,7 +112,8 @@ def build_framework(cfg): # The single entry point for building different model 
     if framework_id not in FRAMEWORK_REGISTRY._registry:
         available = sorted(FRAMEWORK_REGISTRY._registry.keys())
         raise NotImplementedError(
-            f"Framework `{framework_id}` is not implemented. Available frameworks: {available}"
+            f"Framework `{framework_id}` is not implemented. Available frameworks: {available}. "
+            f"Modules that failed to import: {_FRAMEWORK_IMPORT_ERRORS}"
         )
 
     # This applies to every evaluation model, not to one framework or one

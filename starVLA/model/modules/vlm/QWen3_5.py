@@ -34,6 +34,24 @@ _ACTION_TOKEN_MAX = (
 
 
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+def _patch_embed_as_linear(patch_embed: nn.Module) -> None:
+    """Run the vision patch-embed Conv3d as an equivalent matmul.
+
+    kernel_size == stride and each input is exactly one patch, so the conv is a linear layer over the
+    flattened patch. cuDNN Conv3d in bf16 is extremely slow on torch 2.9 (~50s/step at bs32 on GH200);
+    the weights stay in the Conv3d so checkpoints are unchanged.
+    """
+    proj = patch_embed.proj
+
+    def forward(hidden_states: torch.Tensor) -> torch.Tensor:
+        weight = proj.weight.view(proj.out_channels, -1)
+        hidden_states = hidden_states.view(-1, weight.shape[1]).to(dtype=weight.dtype)
+        return F.linear(hidden_states, weight, proj.bias)
+
+    patch_embed.forward = forward
 
 
 class _QWen3_5_VL_Interface(nn.Module):
@@ -74,6 +92,7 @@ class _QWen3_5_VL_Interface(nn.Module):
             # torch_dtype: float32 so small lr updates are not rounded away.
             torch_dtype=getattr(torch, str(qwenvl_config.get("torch_dtype", "bfloat16"))),
         )
+        _patch_embed_as_linear(model.model.visual.patch_embed)
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 
@@ -155,8 +174,17 @@ class _QWen3_5_VL_Interface(nn.Module):
 
         # Preparation for inference
 
+        # fla's Triton kernels (Qwen3.5 linear attention) take the token count as a constexpr, so every new
+        # sequence length triggers a recompile; padding to a fixed multiple keeps the set of lengths small.
+        pad_to_multiple_of = self.config.framework.get("qwenvl", {}).get("pad_to_multiple_of", None)
         batch_inputs = self.processor.apply_chat_template(
-            messages, tokenize=True, padding=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"
+            messages,
+            tokenize=True,
+            padding=True,
+            pad_to_multiple_of=pad_to_multiple_of,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
         )
 
         # if solutions, mask out the solution tokens in labels

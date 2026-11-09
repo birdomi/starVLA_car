@@ -230,6 +230,7 @@ class VLATrainer(TrainerUtils):
         )
 
         self._install_grad_norm_probe()
+        self._install_nonfinite_guard()
         self._unpin_cpu_affinity()
         self._init_wandb()
 
@@ -282,6 +283,37 @@ class VLATrainer(TrainerUtils):
                 p.register_post_accumulate_grad_hook(_hook)
                 n += 1
         logger.info(f"grad-norm probe installed on {n} trainable tensors")
+
+    def _install_nonfinite_guard(self):
+        """trainer.skip_nonfinite_steps: skip the optimizer step whenever a gradient is inf / NaN.
+
+        DeepSpeed ZeRO-1/2 checks the gradients for overflow only under fp16 (loss scaling). Under bf16 a single inf /
+        NaN gradient goes straight into AdamW and every parameter stays NaN from then on (car_v3_b1024, 10-29: NaN
+        from step ~2450 on). The guard runs ZeRO's own overflow check before each step (all-reduced over the
+        data-parallel group, so every rank skips together); on overflow ZeRO zeroes the gradients and returns without
+        updating, exactly as for an fp16 overflow. Note accelerator.backward() already calls engine.step()."""
+        self._nonfinite_skips = None
+        if not getattr(self.config.trainer, "skip_nonfinite_steps", False):
+            return
+        wrapped = getattr(self.accelerator, "deepspeed_engine_wrapped", None)
+        zero_opt = getattr(getattr(wrapped, "engine", None), "optimizer", None)
+        if zero_opt is None or not hasattr(zero_opt, "check_overflow"):
+            logger.warning("trainer.skip_nonfinite_steps: no DeepSpeed ZeRO optimizer, guard not installed")
+            return
+        self._nonfinite_skips = 0
+        step = zero_opt.step
+
+        def guarded_step(*args, **kwargs):
+            zero_opt.check_overflow()
+            if zero_opt.overflow:
+                self._nonfinite_skips += 1
+                if self.accelerator.is_main_process:
+                    logger.warning(f"non-finite gradient at step {self.completed_steps + 1}: optimizer step skipped "
+                                   f"({self._nonfinite_skips} so far)")
+            return step(*args, **kwargs)
+
+        zero_opt.step = guarded_step
+        logger.info("trainer.skip_nonfinite_steps: the ZeRO optimizer step skips inf / NaN gradients")
 
     def _calculate_total_batch_size(self):
         """Calculate global batch size."""
@@ -608,6 +640,11 @@ class VLATrainer(TrainerUtils):
                 action_loss = output_dict.get("action_loss")
                 total_loss = output_dict["loss"] if "loss" in output_dict else action_loss
 
+            if self._nonfinite_skips is not None and not torch.isfinite(total_loss.detach()):
+                logger.warning(f"rank {self.accelerator.process_index}: non-finite loss {float(total_loss)} at step "
+                               f"{self.completed_steps + 1}, instructions {[ex.get('lang') for ex in batch_vla][:8]}",
+                               main_process_only=False)
+
             # Grad-norm probe: under DeepSpeed, accelerator.backward() runs
             # engine.backward AND engine.step (which zeroes grads), so grads
             # must be captured DURING backward by the hooks installed in
@@ -646,6 +683,8 @@ class VLATrainer(TrainerUtils):
             metrics["total_loss"] = total_loss.item()
         if grad_norm is not None:
             metrics["grad_norm"] = grad_norm
+        if self._nonfinite_skips is not None:
+            metrics["nonfinite_skips"] = self._nonfinite_skips
         metrics["timing/backward"] = _bwd_time
         metrics["timing/optimizer"] = _opt_time
         # pass through extra scalar stats from the framework (e.g. wta/*)
@@ -653,6 +692,25 @@ class VLATrainer(TrainerUtils):
             if k not in ("action_loss", "loss") and isinstance(v, (int, float)):
                 metrics[k] = v
         return metrics
+
+    def _shutdown_data_workers(self):
+        """Kill the dataloader worker processes. On long RoboCasa runs the per-user thread limit is exhausted by the
+        end, so NCCL could not start its shutdown thread in destroy_process_group (pthread_create: Resource
+        temporarily unavailable) and finished runs ended FAILED. SIGTERM needs no new thread, unlike
+        DataLoader._shutdown_workers(), whose queue feeder thread cannot start then either ("can't start new thread")."""
+        import multiprocessing
+
+        # persistent workers' iterator lives in DataLoader._iterator (on the accelerate wrapper's base_dataloader);
+        # mark it shut down so its __del__ does not retry the graceful path
+        for dl in (self.vla_train_dataloader, getattr(self.vla_train_dataloader, "base_dataloader", None)):
+            it = getattr(dl, "_iterator", None)
+            if hasattr(it, "_shutdown"):
+                it._shutdown = True
+        for p in multiprocessing.active_children():
+            p.terminate()
+        for p in multiprocessing.active_children():
+            p.join(timeout=10)
+        self.vla_iter = None
 
     def _finalize_training(self):
         """Training end processing."""
@@ -677,6 +735,11 @@ class VLATrainer(TrainerUtils):
             except Exception:
                 pass
 
+        # after the final save: nothing below may stand between a finished run and its final_model
+        try:
+            self._shutdown_data_workers()
+        except Exception as e:
+            logger.warning(f"dataloader worker shutdown failed (ignored): {e}", main_process_only=False)
         self.accelerator.wait_for_everyone()
 
 
@@ -706,7 +769,10 @@ def main(cfg) -> None:
     logger.info("... and that's all, folks!")
     if dist.is_initialized():
         dist.barrier()
-        dist.destroy_process_group()
+        try:
+            dist.destroy_process_group()
+        except Exception as e:  # everything is saved by now; a teardown hiccup must not mark the job FAILED
+            logger.warning(f"destroy_process_group failed after training finished (ignored): {e}", main_process_only=False)
 
 
 if __name__ == "__main__":

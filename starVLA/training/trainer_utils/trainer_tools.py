@@ -119,7 +119,8 @@ def build_param_lr_groups(model, cfg):
         try:
             for attr in freeze_path.split("."):
                 module = getattr(module, attr)
-            frozen_params.update(id(p) for p in module.parameters())
+            # a path may also name a bare nn.Parameter (e.g. episode_memory.init_tokens)
+            frozen_params.update(id(p) for p in ([module] if isinstance(module, torch.nn.Parameter) else module.parameters()))
         except AttributeError:
             print(f"⚠️ freeze module path does not exist: {freeze_path}")
             continue
@@ -223,7 +224,9 @@ class TrainerUtils:
                     for attr in attrs:
                         module = getattr(module, attr)
                     # if the module is successfully get, freeze it and its all submodule parameters
-                    for param in module.parameters():
+                    # (a path may also name a bare nn.Parameter, e.g. episode_memory.init_tokens)
+                    params = [module] if isinstance(module, torch.nn.Parameter) else module.parameters()
+                    for param in params:
                         param.requires_grad = False
                     frozen.append(path)
                 except AttributeError:

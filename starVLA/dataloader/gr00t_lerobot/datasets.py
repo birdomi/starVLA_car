@@ -635,6 +635,11 @@ class LeRobotSingleDataset(Dataset):
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
         # indict letobot version
         self._lerobot_version =  self.data_cfg.get("lerobot_version", "v2.0") #self._indict_lerobot_version(**kwargs)
+        # data_cfg.lerobot_version: auto -> per dataset from meta/info.json codebase_version, so one mixture can mix
+        # v2.0 and v3.0 exports (e.g. car_v3_3cam_headstate)
+        if self._lerobot_version == "auto":
+            with open(Path(dataset_path) / "meta" / "info.json") as f:
+                self._lerobot_version = json.load(f)["codebase_version"]
 
         self._action_mode = None
         self._action_mode_state_map = {}
@@ -704,12 +709,25 @@ class LeRobotSingleDataset(Dataset):
         # finished). Like the cap above, only the step list is filtered; statistics are untouched.
         # data_cfg.exclude_episodes: explicit episode ids to drop (e.g. bad on video). Ids are
         # per dataset, so only use it with single-dataset mixtures.
+        # data_cfg.episode_lists: json file {"<dataset dir>/<split>": {"include": [ids]} | {"exclude": [ids]}}, keyed by
+        # the last two path components (e.g. "car-0901-ov/train"), so one mixture can take different episodes per dataset.
         _min_len = int(self.data_cfg.get("min_episode_length", 0) or 0) if self.data_cfg else 0
         _exclude = {int(e) for e in (self.data_cfg.get("exclude_episodes", None) or [])} if self.data_cfg else set()
-        if _min_len or _exclude:
+        _include = None
+        _lists_path = self.data_cfg.get("episode_lists", None) if self.data_cfg else None
+        if _lists_path:
+            with open(_lists_path) as f:
+                _entry = json.load(f).get("/".join(self._dataset_path.parts[-2:]))
+            if _entry is not None:
+                _exclude |= {int(e) for e in _entry.get("exclude", [])}
+                if "include" in _entry:
+                    _include = {int(e) for e in _entry["include"]}
+        if _min_len or _exclude or _include is not None:
             _ids = np.asarray(self._trajectory_ids)
             _lens = np.asarray(self._trajectory_lengths)
             _mask = (_lens >= _min_len) & ~np.isin(_ids.astype(np.int64), list(_exclude))
+            if _include is not None:
+                _mask &= np.isin(_ids.astype(np.int64), list(_include))
             if not _mask.all():
                 self._trajectory_ids = _ids[_mask]
                 self._trajectory_lengths = _lens[_mask]
@@ -718,7 +736,7 @@ class LeRobotSingleDataset(Dataset):
                 self._all_steps = [st for st in self._all_steps if int(st[0]) in _keep]
                 if int(os.environ.get("RANK", "0")) == 0:
                     print(
-                        f"[min_episode_length={_min_len}, exclude={sorted(_exclude)}] {self.dataset_name}: dropped {int((~_mask).sum())} "
+                        f"[min_episode_length={_min_len}, exclude={len(_exclude)} ids, include={None if _include is None else len(_include)} ids] {self.dataset_name}: dropped {int((~_mask).sum())} "
                         f"episodes -> {len(self._trajectory_ids)}, steps {_before} -> {len(self._all_steps)}"
                     )
         self.set_transforms_metadata(self.metadata)

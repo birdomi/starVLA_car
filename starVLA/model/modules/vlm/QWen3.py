@@ -25,6 +25,24 @@ _ACTION_TOKEN_MAX = (
 
 
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+def _patch_embed_as_linear(patch_embed: nn.Module) -> None:
+    """Run the vision patch-embed Conv3d as an equivalent matmul (as in QWen3_5.py).
+
+    kernel_size == stride and each input is exactly one patch, so the conv is a linear layer over the
+    flattened patch. cuDNN Conv3d in bf16 is extremely slow on torch 2.9 (~19s per bs16 forward on GH200);
+    the weights stay in the Conv3d so checkpoints are unchanged.
+    """
+    proj = patch_embed.proj
+
+    def forward(hidden_states: torch.Tensor) -> torch.Tensor:
+        weight = proj.weight.view(proj.out_channels, -1)
+        hidden_states = hidden_states.view(-1, weight.shape[1]).to(dtype=weight.dtype)
+        return F.linear(hidden_states, weight, proj.bias)
+
+    patch_embed.forward = forward
 
 
 class _QWen3_VL_Interface(nn.Module):
@@ -63,6 +81,7 @@ class _QWen3_VL_Interface(nn.Module):
             dtype=torch.bfloat16,
             ignore_mismatched_sizes=True, # resize image no longer needed? @TODO check bug
         )
+        _patch_embed_as_linear(model.model.visual.patch_embed)
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 
